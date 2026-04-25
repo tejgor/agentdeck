@@ -22,6 +22,7 @@ function stripTrailingEmptyLines(lines: string[]): string[] {
 export class TerminalPreview {
 	private readonly terminal: InstanceType<typeof Terminal>;
 	private snapshot = '';
+	private dirty = true;
 	private pending: Promise<void> = Promise.resolve();
 	private cols: number;
 	private rows: number;
@@ -35,7 +36,6 @@ export class TerminalPreview {
 			scrollback: DEFAULT_SCROLLBACK,
 			allowProposedApi: true,
 		});
-		this.refreshSnapshot();
 	}
 
 	write(data: string): Promise<void> {
@@ -44,32 +44,47 @@ export class TerminalPreview {
 				() =>
 					new Promise<void>(resolve => {
 						this.terminal.write(data, () => {
-							this.refreshSnapshot();
+							this.dirty = true;
 							resolve();
 						});
 					}),
 			)
 			.catch(() => {
-				this.refreshSnapshot();
+				this.dirty = true;
 			});
 		return this.pending;
 	}
 
 	resize(cols: number, rows: number): Promise<void> {
-		this.cols = clampSize(cols, this.cols);
-		this.rows = clampSize(rows, this.rows);
+		const nextCols = clampSize(cols, this.cols);
+		const nextRows = clampSize(rows, this.rows);
+		if (nextCols === this.cols && nextRows === this.rows) {
+			return this.pending;
+		}
+
+		this.cols = nextCols;
+		this.rows = nextRows;
 		this.pending = this.pending
 			.then(() => {
 				this.terminal.resize(this.cols, this.rows);
-				this.refreshSnapshot();
+				this.dirty = true;
 			})
 			.catch(() => {
-				this.refreshSnapshot();
+				this.dirty = true;
 			});
 		return this.pending;
 	}
 
-	getSnapshot(): string {
+	async getSnapshot(): Promise<string> {
+		await this.pending;
+		if (this.dirty) {
+			this.refreshSnapshot();
+			this.dirty = false;
+		}
+		return this.snapshot;
+	}
+
+	getCachedSnapshot(): string {
 		return this.snapshot;
 	}
 

@@ -72,7 +72,7 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 
 async function ping(): Promise<void> {
 	const response = await request<{ok: true; version?: number}>({type: 'ping', requestId: randomUUID()});

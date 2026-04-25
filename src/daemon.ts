@@ -15,7 +15,7 @@ const SCROLLBACK_LIMIT = 200_000;
 const DEFAULT_PREVIEW_COLS = 80;
 const DEFAULT_PREVIEW_ROWS = 24;
 const PREVIEW_BROADCAST_DELAY_MS = 75;
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 
 interface RuntimeSession {
 	term: IPty;
@@ -134,7 +134,7 @@ export class InkDaemon {
 			if (existing && existing.status !== 'exited') {
 				this.sessions.set(sessionId, {
 					...existing,
-					lastPreview: runtime.preview.getSnapshot(),
+					lastPreview: await runtime.preview.getSnapshot(),
 				});
 			}
 			try {
@@ -334,20 +334,22 @@ export class InkDaemon {
 		}
 		runtime.previewBroadcastTimer = setTimeout(() => {
 			runtime.previewBroadcastTimer = undefined;
-			this.broadcastPreview(sessionId);
+			void this.broadcastPreview(sessionId);
 		}, PREVIEW_BROADCAST_DELAY_MS);
 	}
 
-	private broadcastPreview(sessionId: string): void {
+	private async broadcastPreview(sessionId: string): Promise<void> {
 		const session = this.sessions.get(sessionId);
 		if (!session) {
 			return;
 		}
+		const runtime = this.runtime.get(sessionId);
+		const snapshot = runtime ? await runtime.preview.getSnapshot() : session.lastPreview ?? '';
 		for (const [socket, client] of this.clients.entries()) {
 			if (client.watchedPreviewSessionId !== sessionId) {
 				continue;
 			}
-			const preview = this.buildPreviewRecord(session, this.runtime.get(sessionId)?.preview.getSnapshot() ?? session.lastPreview ?? '');
+			const preview = this.buildPreviewRecord(session, snapshot);
 			sendMessage(socket, {type: 'preview-updated', preview});
 		}
 	}
@@ -382,7 +384,7 @@ export class InkDaemon {
 		if (runtime) {
 			runtime.term.resize(cols, rows);
 			await runtime.preview.resize(cols, rows);
-			return this.buildPreviewRecord(session, runtime.preview.getSnapshot());
+			return this.buildPreviewRecord(session, await runtime.preview.getSnapshot());
 		}
 
 		return this.buildPreviewRecord(session, session.lastPreview ?? '');
@@ -461,16 +463,15 @@ export class InkDaemon {
 
 		term.onData(output => {
 			runtime.scrollback = clampScrollback(runtime.scrollback + output);
-			void runtime.preview.write(output).then(() => {
-				this.schedulePreviewBroadcast(baseSession.id);
-			});
+			void runtime.preview.write(output);
+			this.schedulePreviewBroadcast(baseSession.id);
 			if (runtime.attachedSocket && !runtime.attachedSocket.destroyed) {
 				sendMessage(runtime.attachedSocket, {type: 'output', sessionId: baseSession.id, data: output});
 			}
 		});
 
 		term.onExit(({exitCode, signal}) => {
-			this.handleSessionExit(baseSession.id, exitCode ?? null, signal ?? null);
+			void this.handleSessionExit(baseSession.id, exitCode ?? null, signal ?? null);
 		});
 
 		await this.persist();
@@ -500,7 +501,7 @@ export class InkDaemon {
 		this.broadcastSessionRemoved(sessionId, existing.repoRoot);
 	}
 
-	private handleSessionExit(sessionId: string, exitCode: number | null, exitSignal: number | null): void {
+	private async handleSessionExit(sessionId: string, exitCode: number | null, exitSignal: number | null): Promise<void> {
 		const existing = this.sessions.get(sessionId);
 		if (!existing || existing.status === 'exited') {
 			return;
@@ -516,7 +517,7 @@ export class InkDaemon {
 			updatedAt: new Date().toISOString(),
 			exitCode,
 			exitSignal,
-			lastPreview: runtime?.preview.getSnapshot() ?? existing.lastPreview,
+			lastPreview: runtime ? await runtime.preview.getSnapshot() : existing.lastPreview,
 		};
 		this.sessions.set(sessionId, updated);
 		void this.persist();
