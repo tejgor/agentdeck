@@ -10,6 +10,14 @@ export function getSocketPath(): string {
 	return path.join(getConfigDir(), 'ink-daemon.sock');
 }
 
+export function getDaemonPidPath(): string {
+	return path.join(getConfigDir(), 'ink-daemon.pid');
+}
+
+export function getDaemonLogPath(): string {
+	return path.join(getConfigDir(), 'ink-daemon.log');
+}
+
 export function getStatePath(): string {
 	return path.join(getConfigDir(), 'ink-state.json');
 }

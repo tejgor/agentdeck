@@ -1,8 +1,17 @@
 import fs from 'node:fs/promises';
+import {closeSync, openSync} from 'node:fs';
 import net from 'node:net';
 import {spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
-import {getCliEntryPath, getProjectRoot, getSocketPath, isDevRuntime} from './paths.js';
+import {
+	getCliEntryPath,
+	getConfigDir,
+	getDaemonLogPath,
+	getDaemonPidPath,
+	getProjectRoot,
+	getSocketPath,
+	isDevRuntime,
+} from './paths.js';
 import type {ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, SessionRecord} from './types.js';
 
 function createConnection(): Promise<net.Socket> {
@@ -72,41 +81,71 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
+
+class ProtocolMismatchError extends Error {}
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 
 async function ping(): Promise<void> {
 	const response = await request<{ok: true; version?: number}>({type: 'ping', requestId: randomUUID()});
 	if (response.version !== PROTOCOL_VERSION) {
-		throw new Error(`daemon protocol mismatch: expected v${PROTOCOL_VERSION}, got ${String(response.version)}`);
+		throw new ProtocolMismatchError(
+			`daemon protocol mismatch: expected v${PROTOCOL_VERSION}, got ${String(response.version)}`,
+		);
 	}
+}
+
+async function readDaemonPid(): Promise<number | undefined> {
+	try {
+		const raw = await fs.readFile(getDaemonPidPath(), 'utf8');
+		const pid = Number.parseInt(raw.trim(), 10);
+		return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isProcessAlive(pid: number | undefined): boolean {
+	if (!pid) {
+		return false;
+	}
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function appendClientLog(message: string): Promise<void> {
+	await fs.mkdir(getConfigDir(), {recursive: true});
+	await fs.appendFile(getDaemonLogPath(), `[${new Date().toISOString()}] client ${message}\n`, 'utf8');
 }
 
 function spawnDaemon(): void {
 	const cliPath = getCliEntryPath();
 	const args = isDevRuntime() ? ['--import', 'tsx', cliPath, '--daemon'] : [cliPath, '--daemon'];
-	const child = spawn(process.execPath, args, {
-		cwd: getProjectRoot(),
-		env: {...process.env},
-		detached: true,
-		stdio: 'ignore',
-	});
-	child.unref();
+	const stdoutFd = openSync(getDaemonLogPath(), 'a');
+	const stderrFd = openSync(getDaemonLogPath(), 'a');
+	try {
+		const child = spawn(process.execPath, args, {
+			cwd: getProjectRoot(),
+			env: {...process.env, DECKHAND_DAEMON: '1'},
+			detached: true,
+			stdio: ['ignore', stdoutFd, stderrFd],
+		});
+		child.unref();
+	} finally {
+		closeSync(stdoutFd);
+		closeSync(stderrFd);
+	}
 }
 
-export async function ensureDaemonRunning(): Promise<void> {
-	try {
-		await ping();
-		return;
-	} catch {
-		try {
-			await fs.unlink(getSocketPath());
-		} catch {
-			// ignore stale socket cleanup failures
-		}
-		spawnDaemon();
-	}
-
-	const deadline = Date.now() + 5000;
+async function waitForDaemon(deadlineMs: number): Promise<void> {
+	const deadline = Date.now() + deadlineMs;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		try {
@@ -117,7 +156,44 @@ export async function ensureDaemonRunning(): Promise<void> {
 			await new Promise(resolve => setTimeout(resolve, 150));
 		}
 	}
-	throw new Error(`failed to start daemon: ${String(lastError)}`);
+	throw new Error(`failed to start daemon: ${describeError(lastError)}`);
+}
+
+export async function ensureDaemonRunning(): Promise<void> {
+	try {
+		await ping();
+		return;
+	} catch (initialError) {
+		const pid = await readDaemonPid();
+		if (initialError instanceof ProtocolMismatchError && isProcessAlive(pid)) {
+			await appendClientLog(`refusing to replace live daemon pid ${pid} after protocol mismatch: ${initialError.message}`);
+			throw initialError;
+		}
+
+		if (isProcessAlive(pid)) {
+			await appendClientLog(
+				`ping failed while daemon pid ${pid} is still alive; retrying before replacement: ${describeError(initialError)}`,
+			);
+			try {
+				await waitForDaemon(2000);
+				return;
+			} catch (retryError) {
+				throw new Error(
+					`daemon pid ${pid} is alive but did not respond; see ${getDaemonLogPath()}: ${describeError(retryError)}`,
+				);
+			}
+		}
+
+		await appendClientLog(`starting daemon after ping failure: ${describeError(initialError)}`);
+		try {
+			await fs.unlink(getSocketPath());
+		} catch {
+			// ignore stale socket cleanup failures
+		}
+		spawnDaemon();
+	}
+
+	await waitForDaemon(5000);
 }
 
 export async function listSessions(): Promise<SessionRecord[]> {

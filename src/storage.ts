@@ -42,6 +42,10 @@ export async function saveSessions(sessions: SessionRecord[]): Promise<void> {
 	await saveState({sessions});
 }
 
+// Daemon-crash/restart recovery: live PTYs are owned by the daemon process.
+// If a new daemon process starts, any persisted non-exited sessions no longer
+// have live node-pty handles and must be shown as exited. Normal frontend quit
+// should not reach this path because the daemon should remain alive.
 export async function markAllNonExitedSessionsExited(): Promise<SessionRecord[]> {
 	const state = await loadState();
 	let changed = false;

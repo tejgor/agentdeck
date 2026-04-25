@@ -4,7 +4,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {randomUUID} from 'node:crypto';
 import pty, {type IPty} from 'node-pty';
-import {getSocketPath} from './paths.js';
+import {getDaemonLogPath, getDaemonPidPath, getSocketPath} from './paths.js';
 import {ensureNodePtyReady} from './nodePty.js';
 import {ensureConfigDir, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
 import {TerminalPreview} from './terminalPreview.js';
@@ -15,7 +15,7 @@ const SCROLLBACK_LIMIT = 200_000;
 const DEFAULT_PREVIEW_COLS = 80;
 const DEFAULT_PREVIEW_ROWS = 24;
 const PREVIEW_BROADCAST_DELAY_MS = 75;
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 
 interface RuntimeSession {
 	term: IPty;
@@ -78,10 +78,16 @@ export class InkDaemon {
 	private readonly runtime = new Map<string, RuntimeSession>();
 	private readonly clients = new Map<net.Socket, ClientSubscription>();
 	private server?: net.Server;
+	private shuttingDown = false;
 
 	async start(): Promise<void> {
 		await ensureConfigDir();
+		await this.log(`starting daemon pid=${process.pid}`);
+		await this.assertNoLiveDaemonFromPidFile();
 		await ensureNodePtyReady();
+		// If this daemon is starting, any previously-running sessions belonged to a
+		// different daemon process and their node-pty handles are gone. Mark them
+		// exited as crash/restart recovery, not as normal frontend quit behavior.
 		const stored = await markAllNonExitedSessionsExited();
 		for (const session of stored) {
 			this.sessions.set(session.id, session);
@@ -89,12 +95,64 @@ export class InkDaemon {
 
 		await this.prepareSocket();
 		await this.listen();
+		await this.writePidFile();
 		this.setupProcessHandlers();
+		await this.log(`daemon ready socket=${getSocketPath()}`);
+	}
+
+	private async log(message: string): Promise<void> {
+		try {
+			await fs.appendFile(getDaemonLogPath(), `[${new Date().toISOString()}] daemon ${message}\n`, 'utf8');
+		} catch {
+			// Logging must never keep the daemon from starting or shutting down.
+		}
+	}
+
+	private isProcessAlive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	private async assertNoLiveDaemonFromPidFile(): Promise<void> {
+		try {
+			const raw = await fs.readFile(getDaemonPidPath(), 'utf8');
+			const pid = Number.parseInt(raw.trim(), 10);
+			if (Number.isFinite(pid) && pid > 0 && pid !== process.pid && this.isProcessAlive(pid)) {
+				throw new Error(`daemon already appears to be running as pid ${pid}`);
+			}
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code === 'ENOENT') {
+				return;
+			}
+			throw error;
+		}
+	}
+
+	private async writePidFile(): Promise<void> {
+		await fs.writeFile(getDaemonPidPath(), `${process.pid}\n`, 'utf8');
+	}
+
+	private async removePidFile(): Promise<void> {
+		try {
+			const raw = await fs.readFile(getDaemonPidPath(), 'utf8');
+			if (Number.parseInt(raw.trim(), 10) !== process.pid) {
+				return;
+			}
+			await fs.unlink(getDaemonPidPath());
+		} catch {
+			// ignore pid cleanup failures
+		}
 	}
 
 	private async prepareSocket(): Promise<void> {
 		try {
 			await fs.unlink(getSocketPath());
+			await this.log('removed stale socket before listen');
 		} catch (error) {
 			const err = error as NodeJS.ErrnoException;
 			if (err.code !== 'ENOENT') {
@@ -112,15 +170,47 @@ export class InkDaemon {
 	}
 
 	private setupProcessHandlers(): void {
-		const shutdown = async () => {
-			await this.cleanup();
-			process.exit(0);
+		const shutdown = async (signal: NodeJS.Signals) => {
+			try {
+				await this.log(`received ${signal}; shutting down`);
+				await this.cleanup();
+			} finally {
+				process.exit(0);
+			}
 		};
-		process.on('SIGINT', shutdown);
-		process.on('SIGTERM', shutdown);
+		process.on('SIGINT', () => void shutdown('SIGINT'));
+		process.on('SIGTERM', () => void shutdown('SIGTERM'));
+		process.on('SIGHUP', () => {
+			void this.log('received SIGHUP; keeping daemon alive');
+		});
+		process.on('uncaughtException', error => {
+			void (async () => {
+				try {
+					await this.log(`uncaught exception: ${error.stack || error.message}`);
+					await this.cleanup();
+				} finally {
+					process.exit(1);
+				}
+			})();
+		});
+		process.on('unhandledRejection', reason => {
+			void (async () => {
+				try {
+					await this.log(`unhandled rejection: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`);
+					await this.cleanup();
+				} finally {
+					process.exit(1);
+				}
+			})();
+		});
 	}
 
 	private async cleanup(): Promise<void> {
+		if (this.shuttingDown) {
+			return;
+		}
+		this.shuttingDown = true;
+		await this.log('cleanup start');
 		for (const socket of this.clients.keys()) {
 			socket.destroy();
 		}
@@ -155,9 +245,12 @@ export class InkDaemon {
 		} catch {
 			// ignore socket cleanup failures
 		}
+		await this.removePidFile();
+		await this.log('cleanup complete');
 	}
 
 	private handleConnection(socket: net.Socket): void {
+		void this.log('client connected');
 		this.clients.set(socket, {
 			previewCols: DEFAULT_PREVIEW_COLS,
 			previewRows: DEFAULT_PREVIEW_ROWS,
@@ -175,6 +268,7 @@ export class InkDaemon {
 				attachedSessionId = undefined;
 			}
 			this.clients.delete(socket);
+			void this.log('client disconnected');
 		};
 
 		socket.on('data', chunk => {

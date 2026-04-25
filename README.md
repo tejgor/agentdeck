@@ -12,6 +12,8 @@ Fresh Ink-based rewrite prototype for multi-agent terminal workflow.
 - attaches/detaches from running sessions
 - freezes the last preview frame when a session exits
 - stores state in `~/.deckhand/ink-state.json`
+- writes daemon diagnostics to `~/.deckhand/ink-daemon.log`
+- tracks the active daemon PID in `~/.deckhand/ink-daemon.pid`
 
 ## Run
 
