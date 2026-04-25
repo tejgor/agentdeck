@@ -1,0 +1,25 @@
+{
+  "name": "deckhand",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "DECKHAND_DEV=1 node --import tsx src/cli.ts",
+    "daemon": "DECKHAND_DEV=1 node --import tsx src/cli.ts --daemon",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "postinstall": "node scripts/fix-node-pty.js"
+  },
+  "dependencies": {
+    "@xterm/headless": "^5.5.0",
+    "ink": "^6.3.1",
+    "node-pty": "^1.1.0",
+    "react": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.3"
+  }
+}
