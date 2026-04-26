@@ -19,6 +19,7 @@ const ACTIVITY_EVALUATION_DELAY_MS = 150;
 const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
+const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
 const PROTOCOL_VERSION = 6;
 
 interface RuntimeSession {
@@ -29,6 +30,7 @@ interface RuntimeSession {
 	previewBroadcastTimer?: NodeJS.Timeout;
 	activityEvaluationTimer?: NodeJS.Timeout;
 	activityIdleTimer?: NodeJS.Timeout;
+	suppressActivityUntil?: number;
 	lastPreviewSnapshot: string;
 	previewChangeEvents: Array<{at: number; changedChars: number}>;
 }
@@ -389,6 +391,7 @@ export class InkDaemon {
 						const rows = Math.max(1, message.rows);
 						runtime.term.resize(cols, rows);
 						await runtime.preview.resize(cols, rows);
+						await this.suppressResizeActivity(runtime);
 						this.schedulePreviewBroadcast(message.sessionId);
 					}
 					return;
@@ -466,7 +469,7 @@ export class InkDaemon {
 
 	private scheduleActivityEvaluation(sessionId: string): void {
 		const runtime = this.runtime.get(sessionId);
-		if (!runtime || runtime.activityEvaluationTimer) {
+		if (!runtime || runtime.activityEvaluationTimer || Date.now() < (runtime.suppressActivityUntil ?? 0)) {
 			return;
 		}
 		runtime.activityEvaluationTimer = setTimeout(() => {
@@ -478,7 +481,7 @@ export class InkDaemon {
 	private async evaluatePreviewActivity(sessionId: string): Promise<void> {
 		const session = this.sessions.get(sessionId);
 		const runtime = this.runtime.get(sessionId);
-		if (!session || !runtime || session.status !== 'running') {
+		if (!session || !runtime || session.status !== 'running' || Date.now() < (runtime.suppressActivityUntil ?? 0)) {
 			return;
 		}
 
@@ -506,6 +509,11 @@ export class InkDaemon {
 			runtime.previewChangeEvents = [];
 			void this.setAgentStatus(sessionId, 'idle');
 		}, IDLE_AFTER_MS);
+	}
+
+	private async suppressResizeActivity(runtime: RuntimeSession): Promise<void> {
+		runtime.suppressActivityUntil = Date.now() + RESIZE_ACTIVITY_SUPPRESSION_MS;
+		runtime.lastPreviewSnapshot = await runtime.preview.getSnapshot();
 	}
 
 	private async setAgentStatus(sessionId: string, agentStatus: AgentActivityStatus): Promise<void> {
@@ -572,6 +580,7 @@ export class InkDaemon {
 		if (runtime) {
 			runtime.term.resize(cols, rows);
 			await runtime.preview.resize(cols, rows);
+			await this.suppressResizeActivity(runtime);
 			return this.buildPreviewRecord(session, await runtime.preview.getSnapshot());
 		}
 

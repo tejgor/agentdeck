@@ -7,12 +7,22 @@ import {InkDaemon} from './daemon.js';
 import {ensureGitRepo} from './git.js';
 import type {UiExitResult} from './types.js';
 
-async function runUi(): Promise<UiExitResult | undefined> {
+async function runUi(sidebarWidth: {current?: number}): Promise<UiExitResult | undefined> {
 	const repoRoot = await ensureGitRepo(process.cwd());
-	const instance = render(React.createElement(App, {repoRoot, cwd: repoRoot}), {
-		exitOnCtrlC: true,
-		patchConsole: false,
-	});
+	const instance = render(
+		React.createElement(App, {
+			repoRoot,
+			cwd: repoRoot,
+			initialSidebarWidth: sidebarWidth.current,
+			onSidebarWidthChange: width => {
+				sidebarWidth.current = width;
+			},
+		}),
+		{
+			exitOnCtrlC: true,
+			patchConsole: false,
+		},
+	);
 	return instance.waitUntilExit() as Promise<UiExitResult | undefined>;
 }
 
@@ -24,8 +34,9 @@ async function main(): Promise<void> {
 		return;
 	}
 
+	const sidebarWidth: {current?: number} = {};
 	while (true) {
-		const result = await runUi();
+		const result = await runUi(sidebarWidth);
 		if (!result || result.kind === 'quit') {
 			return;
 		}

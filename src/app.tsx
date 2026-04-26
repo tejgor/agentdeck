@@ -22,6 +22,8 @@ type Mode = 'browse' | 'pick-program' | 'enter-name';
 interface AppProps {
 	repoRoot: string;
 	cwd: string;
+	initialSidebarWidth?: number;
+	onSidebarWidthChange?: (width: number) => void;
 }
 
 interface TerminalSize {
@@ -42,8 +44,13 @@ function sidebarWidth(totalWidth: number): number {
 	}
 	let width = Math.floor(totalWidth * 0.24);
 	width = Math.max(24, Math.min(34, width));
-	const maxSidebarWidth = Math.max(20, Math.floor(totalWidth / 3));
-	return Math.min(width, maxSidebarWidth);
+	return clampSidebarWidth(width, totalWidth);
+}
+
+function clampSidebarWidth(width: number, totalWidth: number): number {
+	const minWidth = Math.min(18, Math.max(10, totalWidth - 23));
+	const maxWidth = Math.max(minWidth, Math.min(Math.floor(totalWidth * 0.5), totalWidth - 23));
+	return Math.max(minWidth, Math.min(maxWidth, Math.floor(width)));
 }
 
 function sortSessions(sessions: SessionRecord[]): SessionRecord[] {
@@ -114,7 +121,7 @@ function CreatePane({
 	);
 }
 
-export function App({repoRoot, cwd}: AppProps) {
+export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: AppProps) {
 	const {exit} = useApp();
 	const [mode, setMode] = useState<Mode>('browse');
 	const [sessions, setSessions] = useState<SessionRecord[]>([]);
@@ -127,6 +134,7 @@ export function App({repoRoot, cwd}: AppProps) {
 	const [client, setClient] = useState<LiveClient | undefined>();
 	const [connectionEpoch, setConnectionEpoch] = useState(0);
 	const [terminalSize, setTerminalSize] = useState<TerminalSize>(getTerminalSize());
+	const [sidebarWidthOverride, setSidebarWidthOverride] = useState<number | undefined>(initialSidebarWidth);
 	const [spinnerIndex, setSpinnerIndex] = useState(0);
 	const selectedIdRef = useRef<string | undefined>(selectedId);
 
@@ -289,7 +297,7 @@ export function App({repoRoot, cwd}: AppProps) {
 	const layout = useMemo(() => {
 		const totalWidth = terminalSize.cols;
 		const totalHeight = terminalSize.rows;
-		const leftWidth = sidebarWidth(totalWidth);
+		const leftWidth = clampSidebarWidth(sidebarWidthOverride ?? sidebarWidth(totalWidth), totalWidth);
 		const separatorWidth = 3;
 		const rightWidth = Math.max(20, totalWidth - leftWidth - separatorWidth);
 		const footerLines = error ? 3 : 2;
@@ -302,7 +310,7 @@ export function App({repoRoot, cwd}: AppProps) {
 			previewCols: rightWidth,
 			previewRows,
 		};
-	}, [error, terminalSize.cols, terminalSize.rows]);
+	}, [error, sidebarWidthOverride, terminalSize.cols, terminalSize.rows]);
 
 	const moveSelection = useCallback(
 		(delta: number) => {
@@ -313,6 +321,18 @@ export function App({repoRoot, cwd}: AppProps) {
 			setSelectedId(sessions[nextIndex]?.id);
 		},
 		[selectedIndex, sessions],
+	);
+
+	const resizeSidebar = useCallback(
+		(delta: number) => {
+			setSidebarWidthOverride(current => {
+				const baseWidth = current ?? sidebarWidth(terminalSize.cols);
+				const nextWidth = clampSidebarWidth(baseWidth + delta, terminalSize.cols);
+				onSidebarWidthChange?.(nextWidth);
+				return nextWidth;
+			});
+		},
+		[onSidebarWidthChange, terminalSize.cols],
 	);
 
 	const refreshSessions = useCallback(async () => {
@@ -442,6 +462,14 @@ export function App({repoRoot, cwd}: AppProps) {
 				moveSelection(1);
 				return;
 			}
+			if (key.leftArrow || input === 'h') {
+				resizeSidebar(-2);
+				return;
+			}
+			if (key.rightArrow || input === 'l') {
+				resizeSidebar(2);
+				return;
+			}
 			if (input === 'x' && selectedSession?.status === 'running') {
 				void killSelected();
 				return;
@@ -531,7 +559,7 @@ export function App({repoRoot, cwd}: AppProps) {
 			</Box>
 			<Text dimColor>
 				{mode === 'browse'
-					? 'n new • enter attach • j/k move • x kill • d delete exited • r refresh • q quit'
+					? 'n new • enter attach • j/k move • h/l resize • x kill • d delete exited • r refresh • q quit'
 					: 'esc cancel'}
 			</Text>
 			{busy ? <Text color="yellow">Working…</Text> : null}
