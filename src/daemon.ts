@@ -22,7 +22,7 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 7;
+const PROTOCOL_VERSION = 8;
 
 interface RuntimeSession {
 	term: IPty;
@@ -355,6 +355,11 @@ export class InkDaemon {
 				}
 				case 'create': {
 					const session = await this.createSession(message.input);
+					sendMessage(socket, response(message.requestId, session));
+					return;
+				}
+				case 'restart': {
+					const session = await this.restartSession(message.sessionId, message.cols, message.rows);
 					sendMessage(socket, response(message.requestId, session));
 					return;
 				}
@@ -726,6 +731,87 @@ export class InkDaemon {
 		await this.persist();
 		this.broadcastSessionUpdated(runningSession);
 		this.schedulePreviewBroadcast(runningSession.id);
+		return runningSession;
+	}
+
+	private async restartSession(sessionId: string, cols: number, rows: number): Promise<SessionRecord> {
+		const existing = this.sessions.get(sessionId);
+		if (!existing) {
+			throw new Error('session does not exist');
+		}
+		if (this.runtime.has(sessionId) || existing.status !== 'exited') {
+			throw new Error('session is already running');
+		}
+
+		const now = new Date().toISOString();
+		const starting: SessionRecord = {
+			...existing,
+			status: 'starting',
+			agentStatus: 'unknown',
+			agentStatusUpdatedAt: now,
+			updatedAt: now,
+			exitCode: undefined,
+			exitSignal: undefined,
+			lastPreview: '',
+		};
+		this.sessions.set(sessionId, starting);
+		await this.persist();
+		this.broadcastSessionUpdated(starting);
+
+		let term: IPty;
+		try {
+			term = pty.spawn(starting.command, [], {
+				name: 'xterm-256color',
+				cwd: starting.cwd,
+				env: {...process.env},
+				cols: Math.max(1, cols),
+				rows: Math.max(1, rows),
+			});
+		} catch (error) {
+			this.sessions.set(sessionId, existing);
+			await this.persist();
+			this.broadcastSessionUpdated(existing);
+			throw error;
+		}
+
+		const runningSession: SessionRecord = {
+			...starting,
+			status: 'running',
+			updatedAt: new Date().toISOString(),
+			pid: term.pid,
+		};
+		this.sessions.set(sessionId, runningSession);
+
+		const runtime: RuntimeSession = {
+			term,
+			scrollback: '',
+			preview: new TerminalPreview(cols, rows),
+			lastPreviewSnapshot: '',
+			previewChangeEvents: [],
+		};
+		this.runtime.set(sessionId, runtime);
+		runtime.activityIdleTimer = setTimeout(() => {
+			runtime.activityIdleTimer = undefined;
+			void this.setAgentStatus(sessionId, 'idle');
+		}, IDLE_AFTER_MS);
+
+		term.onData(output => {
+			runtime.scrollback = clampScrollback(runtime.scrollback + output);
+			void runtime.preview.write(output);
+			this.scheduleActivityEvaluation(sessionId);
+			this.schedulePreviewBroadcast(sessionId);
+			if (runtime.attachedSocket && !runtime.attachedSocket.destroyed) {
+				sendMessage(runtime.attachedSocket, {type: 'output', sessionId, data: output});
+			}
+		});
+
+		term.onExit(({exitCode, signal}) => {
+			void this.handleSessionExit(sessionId, exitCode ?? null, signal ?? null);
+		});
+
+		await this.persist();
+		this.broadcastSessionUpdated(runningSession);
+		this.schedulePreviewBroadcast(sessionId);
 		return runningSession;
 	}
 

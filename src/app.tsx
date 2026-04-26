@@ -496,6 +496,23 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		}
 	}, [client, selectedSession]);
 
+	const restartSelected = useCallback(async () => {
+		if (!client || !selectedSession || selectedSession.status !== 'exited') {
+			return;
+		}
+		setBusy(true);
+		setError(undefined);
+		try {
+			const restarted = await client.restartSession(selectedSession.id, layout.previewCols, layout.previewRows);
+			setSelectedId(restarted.id);
+			setSessions(current => upsertSession(current, restarted));
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client, layout.previewCols, layout.previewRows, selectedSession]);
+
 	useInput((input, key) => {
 		if (busy) {
 			return;
@@ -546,6 +563,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			}
 			if ((input === 'd' || key.delete) && selectedSession?.status === 'exited') {
 				void removeSelected();
+				return;
+			}
+			if (input === 's' && selectedSession?.status === 'exited') {
+				void restartSelected();
 				return;
 			}
 			if (key.return && selectedSession?.status === 'running') {
@@ -708,7 +729,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			</Box>
 			<Text dimColor>
 				{mode === 'browse'
-					? 'n new • enter attach • j/k move • h/l resize • x kill • d delete exited • r refresh • q quit'
+					? 'n new • enter attach • j/k move • h/l resize • x kill • s restart exited • d delete exited • r refresh • q quit'
 					: 'esc cancel'}
 			</Text>
 			{busy ? <Text color="yellow">Working…</Text> : null}

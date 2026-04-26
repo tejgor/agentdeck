@@ -70,6 +70,7 @@ export type ClientRequest =
 	| {type: 'list-worktrees'; requestId: string; cwd: string}
 	| {type: 'watch-preview'; requestId: string; sessionId?: string; cols: number; rows: number}
 	| {type: 'create'; requestId: string; input: CreateSessionInput}
+	| {type: 'restart'; requestId: string; sessionId: string; cols: number; rows: number}
 	| {type: 'kill'; requestId: string; sessionId: string; deleteWorktree?: boolean}
 	| {type: 'remove'; requestId: string; sessionId: string}
 	| {type: 'attach'; requestId: string; sessionId: string}
