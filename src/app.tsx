@@ -3,7 +3,7 @@ import {Box, Text, useApp, useInput} from 'ink';
 import {LiveClient, createLiveClient} from './client.js';
 import {PreviewPane} from './preview.js';
 import {Sidebar} from './sidebar.js';
-import type {PreviewRecord, ProgramKey, SessionRecord, UiExitResult} from './types.js';
+import type {PreviewRecord, ProgramKey, SessionRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
 
 const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
 	{key: 'claude', label: 'Claude', glyph: '✶'},
@@ -16,8 +16,13 @@ const EMPTY_PREVIEW: PreviewRecord = {
 };
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const WORKTREE_MODES: Array<{key: WorktreeMode; label: string}> = [
+	{key: 'none', label: 'no worktree'},
+	{key: 'new', label: 'new worktree'},
+	{key: 'existing', label: 'existing worktree'},
+];
 
-type Mode = 'browse' | 'pick-program' | 'enter-name';
+type Mode = 'browse' | 'pick-program' | 'enter-name' | 'pick-worktree' | 'confirm-kill';
 
 interface AppProps {
 	repoRoot: string;
@@ -87,11 +92,13 @@ function CreatePane({
 	mode,
 	programIndex,
 	draftName,
+	worktreeMode,
 	width,
 }: {
-	mode: Exclude<Mode, 'browse'>;
+	mode: 'pick-program' | 'enter-name';
 	programIndex: number;
 	draftName: string;
+	worktreeMode: WorktreeMode;
 	width: number;
 }) {
 	return (
@@ -114,9 +121,46 @@ function CreatePane({
 			) : (
 				<>
 					<Text>Name: {draftName || '█'}</Text>
-					<Text dimColor>enter create • esc back • backspace delete</Text>
+					<Text>Worktree: {WORKTREE_MODES.find(item => item.key === worktreeMode)?.label}</Text>
+					<Text dimColor>tab cycle worktree • enter create • esc back • backspace delete</Text>
 				</>
 			)}
+		</Box>
+	);
+}
+
+function worktreeLabel(worktree: WorktreeInfoRecord): string {
+	const branch = worktree.branch || '(detached)';
+	return `${worktree.isMain ? 'main ' : ''}${branch}  ${worktree.path}`;
+}
+
+function WorktreePickerPane({worktrees, selectedIndex, width}: {worktrees: WorktreeInfoRecord[]; selectedIndex: number; width: number}) {
+	return (
+		<Box flexDirection="column" width={width}>
+			<Text bold>Select existing worktree</Text>
+			{worktrees.length === 0 ? <Text dimColor>No worktrees found.</Text> : null}
+			{worktrees.map((worktree, index) => (
+				<Text key={worktree.path} inverse={index === selectedIndex}>
+					{index === selectedIndex ? '›' : ' '} {worktreeLabel(worktree)}
+				</Text>
+			))}
+			<Text dimColor>enter select • esc back • j/k move</Text>
+		</Box>
+	);
+}
+
+function KillConfirmPane({session, selectedIndex, canDelete, width}: {session?: SessionRecord; selectedIndex: number; canDelete: boolean; width: number}) {
+	const options = canDelete ? ['Kill only, keep worktree', 'Kill and delete worktree', 'Cancel'] : ['Kill session', 'Cancel'];
+	return (
+		<Box flexDirection="column" width={width}>
+			<Text bold>Kill session{session ? ` "${session.title}"` : ''}?</Text>
+			{session?.worktree?.path ? <Text dimColor>{session.worktree.path}</Text> : null}
+			{options.map((option, index) => (
+				<Text key={option} inverse={index === selectedIndex}>
+					{index === selectedIndex ? '›' : ' '} {option}
+				</Text>
+			))}
+			<Text dimColor>enter choose • esc cancel • j/k move</Text>
 		</Box>
 	);
 }
@@ -128,6 +172,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 	const [selectedId, setSelectedId] = useState<string | undefined>();
 	const [programIndex, setProgramIndex] = useState(0);
 	const [draftName, setDraftName] = useState('');
+	const [worktreeMode, setWorktreeMode] = useState<WorktreeMode>('none');
+	const [worktrees, setWorktrees] = useState<WorktreeInfoRecord[]>([]);
+	const [worktreeIndex, setWorktreeIndex] = useState(0);
+	const [killConfirmIndex, setKillConfirmIndex] = useState(0);
 	const [preview, setPreview] = useState<PreviewRecord>(EMPTY_PREVIEW);
 	const [error, setError] = useState<string | undefined>();
 	const [busy, setBusy] = useState(false);
@@ -268,6 +316,18 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 	}, [selectedId, sessions]);
 
 	const selectedSession = sessions[selectedIndex];
+	const selectedCanDeleteWorktree = Boolean(
+		selectedSession?.worktree?.path &&
+		selectedSession.worktree.mode !== 'none' &&
+		!selectedSession.worktree.isMain &&
+		(!selectedSession.launchWorktreeRoot || selectedSession.worktree.path !== selectedSession.launchWorktreeRoot) &&
+		!sessions.some(
+			session =>
+				session.id !== selectedSession.id &&
+				session.status !== 'exited' &&
+				session.worktree?.path === selectedSession.worktree?.path,
+		),
+	);
 
 	useEffect(() => {
 		if (!selectedSession) {
@@ -369,7 +429,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		};
 	}, [client, layout.previewCols, layout.previewRows, selectedId]);
 
-	const submitCreate = useCallback(async () => {
+	const submitCreate = useCallback(async (existingWorktreePath?: string) => {
 		const title = draftName.trim();
 		if (!title) {
 			setError('title cannot be empty');
@@ -389,8 +449,11 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				repoRoot,
 				cols: layout.previewCols,
 				rows: layout.previewRows,
+				worktreeMode,
+				existingWorktreePath,
 			});
 			setDraftName('');
+			setWorktreeMode('none');
 			setMode('browse');
 			setSelectedId(created.id);
 			setSessions(current => upsertSession(current, created));
@@ -399,16 +462,17 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		} finally {
 			setBusy(false);
 		}
-	}, [client, cwd, draftName, layout.previewCols, layout.previewRows, programIndex, repoRoot]);
+	}, [client, cwd, draftName, layout.previewCols, layout.previewRows, programIndex, repoRoot, worktreeMode]);
 
-	const killSelected = useCallback(async () => {
+	const killSelected = useCallback(async (deleteWorktree = false) => {
 		if (!client || !selectedSession || selectedSession.status !== 'running') {
 			return;
 		}
 		setBusy(true);
 		setError(undefined);
 		try {
-			await client.killSession(selectedSession.id);
+			await client.killSession(selectedSession.id, deleteWorktree);
+			setMode('browse');
 		} catch (nextError) {
 			setError(nextError instanceof Error ? nextError.message : String(nextError));
 		} finally {
@@ -445,6 +509,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			if (input === 'n') {
 				setProgramIndex(0);
 				setDraftName('');
+				setWorktreeMode('none');
 				setMode('pick-program');
 				return;
 			}
@@ -471,7 +536,12 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (input === 'x' && selectedSession?.status === 'running') {
-				void killSelected();
+				if (selectedSession.worktree?.path && selectedSession.worktree.mode !== 'none') {
+					setKillConfirmIndex(0);
+					setMode('confirm-kill');
+				} else {
+					void killSelected(false);
+				}
 				return;
 			}
 			if ((input === 'd' || key.delete) && selectedSession?.status === 'exited') {
@@ -509,6 +579,23 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (key.return) {
+				if (worktreeMode === 'existing') {
+					if (!client) {
+						setError('still connecting to daemon');
+						return;
+					}
+					setBusy(true);
+					void client
+						.listWorktrees(cwd)
+						.then(items => {
+							setWorktrees(items);
+							setWorktreeIndex(0);
+							setMode('pick-worktree');
+						})
+						.catch(nextError => setError(nextError instanceof Error ? nextError.message : String(nextError)))
+						.finally(() => setBusy(false));
+					return;
+				}
 				void submitCreate();
 				return;
 			}
@@ -517,10 +604,62 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (key.tab) {
+				setWorktreeMode(current => {
+					const index = WORKTREE_MODES.findIndex(item => item.key === current);
+					return WORKTREE_MODES[(index + 1) % WORKTREE_MODES.length]!.key;
+				});
 				return;
 			}
 			if (input) {
 				setDraftName(value => value + input);
+			}
+			return;
+		}
+
+		if (mode === 'pick-worktree') {
+			if (key.escape) {
+				setMode('enter-name');
+				return;
+			}
+			if (key.upArrow || input === 'k') {
+				setWorktreeIndex(index => Math.max(0, index - 1));
+				return;
+			}
+			if (key.downArrow || input === 'j') {
+				setWorktreeIndex(index => Math.min(Math.max(0, worktrees.length - 1), index + 1));
+				return;
+			}
+			if (key.return && worktrees[worktreeIndex]) {
+				void submitCreate(worktrees[worktreeIndex]!.path);
+				return;
+			}
+			return;
+		}
+
+		if (mode === 'confirm-kill') {
+			const optionCount = selectedCanDeleteWorktree ? 3 : 2;
+			if (key.escape) {
+				setMode('browse');
+				return;
+			}
+			if (key.upArrow || input === 'k') {
+				setKillConfirmIndex(index => (index - 1 + optionCount) % optionCount);
+				return;
+			}
+			if (key.downArrow || input === 'j') {
+				setKillConfirmIndex(index => (index + 1) % optionCount);
+				return;
+			}
+			if (key.return) {
+				if (selectedCanDeleteWorktree) {
+					if (killConfirmIndex === 0) void killSelected(false);
+					else if (killConfirmIndex === 1) void killSelected(true);
+					else setMode('browse');
+				} else {
+					if (killConfirmIndex === 0) void killSelected(false);
+					else setMode('browse');
+				}
+				return;
 			}
 		}
 	});
@@ -548,11 +687,21 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 						height={layout.contentHeight}
 						spinnerFrame={spinnerFrame}
 					/>
+				) : mode === 'pick-worktree' ? (
+					<WorktreePickerPane worktrees={worktrees} selectedIndex={worktreeIndex} width={layout.previewWidth} />
+				) : mode === 'confirm-kill' ? (
+					<KillConfirmPane
+						session={selectedSession}
+						selectedIndex={killConfirmIndex}
+						canDelete={selectedCanDeleteWorktree}
+						width={layout.previewWidth}
+					/>
 				) : (
 					<CreatePane
 						mode={mode}
 						programIndex={programIndex}
 						draftName={draftName}
+						worktreeMode={worktreeMode}
 						width={layout.previewWidth}
 					/>
 				)}

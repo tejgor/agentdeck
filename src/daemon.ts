@@ -1,14 +1,16 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import net from 'node:net';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {randomUUID} from 'node:crypto';
 import pty, {type IPty} from 'node-pty';
 import {getDaemonLogPath, getDaemonPidPath, getSocketPath} from './paths.js';
+import {createWorktreeForSession, findRepoRoot, listWorktrees, removeWorktree} from './git.js';
 import {ensureNodePtyReady} from './nodePty.js';
 import {ensureConfigDir, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {AgentActivityStatus, ClientRequest, PreviewRecord, ServerMessage, ServerResponse, SessionRecord} from './types.js';
+import type {AgentActivityStatus, ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, ServerResponse, SessionRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
@@ -20,7 +22,7 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 6;
+const PROTOCOL_VERSION = 7;
 
 interface RuntimeSession {
 	term: IPty;
@@ -33,6 +35,7 @@ interface RuntimeSession {
 	suppressActivityUntil?: number;
 	lastPreviewSnapshot: string;
 	previewChangeEvents: Array<{at: number; changedChars: number}>;
+	deleteWorktreeOnExit?: boolean;
 }
 
 interface ClientSubscription {
@@ -337,6 +340,10 @@ export class InkDaemon {
 					sendMessage(socket, response(message.requestId, this.sessionsForRepo(message.repoRoot)));
 					return;
 				}
+				case 'list-worktrees': {
+					sendMessage(socket, response(message.requestId, await listWorktrees(message.cwd)));
+					return;
+				}
 				case 'watch-preview': {
 					const client = this.getClient(socket);
 					client.watchedPreviewSessionId = message.sessionId;
@@ -352,7 +359,7 @@ export class InkDaemon {
 					return;
 				}
 				case 'kill':
-					await this.killSession(message.sessionId);
+					await this.killSession(message.sessionId, message.deleteWorktree ?? false);
 					sendMessage(socket, response(message.requestId, {ok: true}));
 					return;
 				case 'remove':
@@ -587,14 +594,7 @@ export class InkDaemon {
 		return this.buildPreviewRecord(session, session.lastPreview ?? '');
 	}
 
-	private async createSession(input: {
-		title: string;
-		program: SessionRecord['program'];
-		cwd: string;
-		repoRoot: string;
-		cols: number;
-		rows: number;
-	}): Promise<SessionRecord> {
+	private async createSession(input: CreateSessionInput): Promise<SessionRecord> {
 		const title = input.title.trim();
 		if (!title) {
 			throw new Error('title cannot be empty');
@@ -610,14 +610,57 @@ export class InkDaemon {
 		}
 
 		const command = await resolveProgramCommand(input.program);
+		const launchCwd = input.cwd;
+		const launchWorktreeRoot = await findRepoRoot(launchCwd);
+		let sessionCwd = launchCwd;
+		let worktree: SessionRecord['worktree'] = {mode: 'none'};
+		const requestedWorktreeMode = input.worktreeMode ?? 'none';
+		if (requestedWorktreeMode === 'new') {
+			const created = await createWorktreeForSession(title, launchCwd);
+			sessionCwd = created.path;
+			worktree = {
+				mode: created.origin === 'created' ? 'managed' : 'attached',
+				path: created.path,
+				branch: created.branch,
+				head: created.head,
+				isMain: created.isMain,
+				origin: created.origin,
+				creator: created.creator,
+				name: created.name,
+			};
+		} else if (requestedWorktreeMode === 'existing') {
+			if (!input.existingWorktreePath) {
+				throw new Error('existing worktree path is required');
+			}
+			const selectedPath = input.existingWorktreePath;
+			const worktrees = await listWorktrees(launchCwd);
+			const selected = worktrees.find(item => item.path === selectedPath);
+			if (!selected) {
+				throw new Error(`selected path is not a git worktree: ${selectedPath}`);
+			}
+			sessionCwd = selected.path;
+			worktree = {
+				mode: 'attached',
+				path: selected.path,
+				branch: selected.branch,
+				head: selected.head,
+				isMain: selected.isMain,
+				origin: 'selected',
+				creator: 'picker',
+				name: selected.branch || selected.path.split('/').at(-1),
+			};
+		}
 		const now = new Date().toISOString();
 		const baseSession: SessionRecord = {
 			id: randomUUID(),
 			title,
 			program: input.program,
 			command,
-			cwd: input.cwd,
+			cwd: sessionCwd,
 			repoRoot: input.repoRoot,
+			launchCwd,
+			launchWorktreeRoot,
+			worktree,
 			status: 'starting',
 			agentStatus: 'unknown',
 			agentStatusUpdatedAt: now,
@@ -633,7 +676,7 @@ export class InkDaemon {
 		try {
 			term = pty.spawn(command, [], {
 				name: 'xterm-256color',
-				cwd: input.cwd,
+				cwd: sessionCwd,
 				env: {...process.env},
 				cols: Math.max(1, input.cols),
 				rows: Math.max(1, input.rows),
@@ -686,10 +729,45 @@ export class InkDaemon {
 		return runningSession;
 	}
 
-	private async killSession(sessionId: string): Promise<void> {
+	private canDeleteSessionWorktree(session: SessionRecord): {ok: true} | {ok: false; reason: string} {
+		const worktree = session.worktree;
+		const worktreePath = worktree?.path;
+		if (!worktreePath || !worktree || worktree.mode === 'none') {
+			return {ok: false, reason: 'session does not have a worktree'};
+		}
+		if (worktree.isMain) {
+			return {ok: false, reason: 'cannot delete the main worktree'};
+		}
+		if (session.launchWorktreeRoot && path.resolve(worktreePath) === path.resolve(session.launchWorktreeRoot)) {
+			return {ok: false, reason: 'cannot delete the current worktree'};
+		}
+		const other = [...this.sessions.values()].find(candidate => {
+			const candidatePath = candidate.worktree?.path;
+			return (
+				candidate.id !== session.id &&
+				candidate.status !== 'exited' &&
+				Boolean(candidatePath) &&
+				path.resolve(candidatePath!) === path.resolve(worktreePath)
+			);
+		});
+		if (other) {
+			return {ok: false, reason: `worktree is in use by session "${other.title}"`};
+		}
+		return {ok: true};
+	}
+
+	private async killSession(sessionId: string, deleteWorktree: boolean): Promise<void> {
+		const session = this.sessions.get(sessionId);
 		const runtime = this.runtime.get(sessionId);
-		if (!runtime) {
+		if (!session || !runtime) {
 			throw new Error('session is not running');
+		}
+		if (deleteWorktree) {
+			const allowed = this.canDeleteSessionWorktree(session);
+			if (!allowed.ok) {
+				throw new Error(allowed.reason);
+			}
+			runtime.deleteWorktreeOnExit = true;
 		}
 		runtime.term.kill();
 	}
@@ -732,6 +810,13 @@ export class InkDaemon {
 			lastPreview: runtime ? await runtime.preview.getSnapshot() : existing.lastPreview,
 		};
 		this.sessions.set(sessionId, updated);
+		if (runtime?.deleteWorktreeOnExit && existing.worktree?.path) {
+			try {
+				await removeWorktree(existing.worktree.path, existing.launchWorktreeRoot ?? existing.repoRoot);
+			} catch (error) {
+				await this.log(`failed to remove worktree for session ${existing.title}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
 		void this.persist();
 		runtime?.preview.dispose();
 		this.broadcastSessionUpdated(updated);

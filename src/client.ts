@@ -12,7 +12,7 @@ import {
 	getSocketPath,
 	isDevRuntime,
 } from './paths.js';
-import type {ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, SessionRecord} from './types.js';
+import type {ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, SessionRecord, WorktreeInfoRecord} from './types.js';
 
 function createConnection(): Promise<net.Socket> {
 	const socketPath = getSocketPath();
@@ -81,7 +81,7 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 6;
+const PROTOCOL_VERSION = 7;
 
 class ProtocolMismatchError extends Error {}
 
@@ -209,9 +209,14 @@ export async function createSession(input: CreateSessionInput): Promise<SessionR
 	return request<SessionRecord>({type: 'create', requestId: randomUUID(), input});
 }
 
-export async function killSession(sessionId: string): Promise<void> {
+export async function killSession(sessionId: string, deleteWorktree = false): Promise<void> {
 	await ensureDaemonRunning();
-	await request({type: 'kill', requestId: randomUUID(), sessionId});
+	await request({type: 'kill', requestId: randomUUID(), sessionId, deleteWorktree});
+}
+
+export async function listWorktrees(cwd: string): Promise<WorktreeInfoRecord[]> {
+	await ensureDaemonRunning();
+	return request<WorktreeInfoRecord[]>({type: 'list-worktrees', requestId: randomUUID(), cwd});
 }
 
 export async function removeSession(sessionId: string): Promise<void> {
@@ -330,8 +335,12 @@ export class LiveClient {
 		return this.request<SessionRecord>({type: 'create', requestId: randomUUID(), input});
 	}
 
-	killSession(sessionId: string): Promise<void> {
-		return this.request({type: 'kill', requestId: randomUUID(), sessionId});
+	listWorktrees(cwd: string): Promise<WorktreeInfoRecord[]> {
+		return this.request<WorktreeInfoRecord[]>({type: 'list-worktrees', requestId: randomUUID(), cwd});
+	}
+
+	killSession(sessionId: string, deleteWorktree = false): Promise<void> {
+		return this.request({type: 'kill', requestId: randomUUID(), sessionId, deleteWorktree});
 	}
 
 	removeSession(sessionId: string): Promise<void> {
