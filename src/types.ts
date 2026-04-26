@@ -1,6 +1,7 @@
 export type ProgramKey = 'claude' | 'pi';
 
 export type SessionStatus = 'starting' | 'running' | 'exited';
+export type AgentActivityStatus = 'unknown' | 'active' | 'idle';
 
 export interface SessionRecord {
 	id: string;
@@ -10,6 +11,8 @@ export interface SessionRecord {
 	cwd: string;
 	repoRoot: string;
 	status: SessionStatus;
+	agentStatus?: AgentActivityStatus;
+	agentStatusUpdatedAt?: string;
 	createdAt: string;
 	updatedAt: string;
 	pid?: number;
@@ -23,6 +26,7 @@ export interface PreviewRecord {
 	content: string;
 	live: boolean;
 	status?: SessionStatus;
+	agentStatus?: AgentActivityStatus;
 }
 
 export interface CreateSessionInput {

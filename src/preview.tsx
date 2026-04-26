@@ -7,6 +7,7 @@ interface PreviewPaneProps {
 	preview: PreviewRecord;
 	width: number;
 	height: number;
+	spinnerFrame: string;
 }
 
 function truncate(text: string, width: number): string {
@@ -44,10 +45,38 @@ function fallbackMessage(session: SessionRecord | undefined, preview: PreviewRec
 	return preview.content || 'Waiting for agent output…';
 }
 
-export function PreviewPane({session, preview, width, height}: PreviewPaneProps) {
-	const header = session
-		? `${session.title} [${session.program}] · ${preview.live ? 'live preview' : session.status}`
-		: 'Preview';
+function programGlyph(program: SessionRecord['program']): string {
+	switch (program) {
+		case 'claude':
+			return '✶';
+		case 'pi':
+			return 'π';
+	}
+}
+
+function statusIcon(session: SessionRecord | undefined, preview: PreviewRecord, spinnerFrame: string): string {
+	if (!session) {
+		return '';
+	}
+	if (session.status === 'starting') {
+		return spinnerFrame;
+	}
+	if (session.status === 'exited') {
+		return '○';
+	}
+	const agentStatus = preview.agentStatus ?? session.agentStatus;
+	if (agentStatus === 'active') {
+		return spinnerFrame;
+	}
+	if (agentStatus === 'idle') {
+		return '●';
+	}
+	return '◌';
+}
+
+export function PreviewPane({session, preview, width, height, spinnerFrame}: PreviewPaneProps) {
+	const icon = statusIcon(session, preview, spinnerFrame);
+	const header = session ? `${programGlyph(session.program)} ${session.title} ${icon}` : 'Preview';
 	const subheader = session ? session.cwd : 'Select a session from the sidebar.';
 	const bodyHeight = Math.max(1, height - 2);
 	const content = fallbackMessage(session, preview);

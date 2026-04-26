@@ -81,7 +81,7 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 5;
+const PROTOCOL_VERSION = 6;
 
 class ProtocolMismatchError extends Error {}
 
@@ -166,8 +166,11 @@ export async function ensureDaemonRunning(): Promise<void> {
 	} catch (initialError) {
 		const pid = await readDaemonPid();
 		if (initialError instanceof ProtocolMismatchError && isProcessAlive(pid)) {
-			await appendClientLog(`refusing to replace live daemon pid ${pid} after protocol mismatch: ${initialError.message}`);
-			throw initialError;
+			const restartHint = `stop the old daemon first: kill ${pid} (or kill $(cat ${getDaemonPidPath()}))`;
+			await appendClientLog(
+				`refusing to replace live daemon pid ${pid} after protocol mismatch: ${initialError.message}; ${restartHint}`,
+			);
+			throw new Error(`${initialError.message}; ${restartHint}`);
 		}
 
 		if (isProcessAlive(pid)) {

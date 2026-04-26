@@ -8,14 +8,18 @@ import {getDaemonLogPath, getDaemonPidPath, getSocketPath} from './paths.js';
 import {ensureNodePtyReady} from './nodePty.js';
 import {ensureConfigDir, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {ClientRequest, PreviewRecord, ServerMessage, ServerResponse, SessionRecord} from './types.js';
+import type {AgentActivityStatus, ClientRequest, PreviewRecord, ServerMessage, ServerResponse, SessionRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
 const DEFAULT_PREVIEW_COLS = 80;
 const DEFAULT_PREVIEW_ROWS = 24;
 const PREVIEW_BROADCAST_DELAY_MS = 75;
-const PROTOCOL_VERSION = 5;
+const ACTIVITY_EVALUATION_DELAY_MS = 150;
+const ACTIVITY_WINDOW_MS = 3000;
+const IDLE_AFTER_MS = 5000;
+const ACTIVE_MIN_CHANGED_CHARS = 1;
+const PROTOCOL_VERSION = 6;
 
 interface RuntimeSession {
 	term: IPty;
@@ -23,6 +27,10 @@ interface RuntimeSession {
 	preview: TerminalPreview;
 	attachedSocket?: net.Socket;
 	previewBroadcastTimer?: NodeJS.Timeout;
+	activityEvaluationTimer?: NodeJS.Timeout;
+	activityIdleTimer?: NodeJS.Timeout;
+	lastPreviewSnapshot: string;
+	previewChangeEvents: Array<{at: number; changedChars: number}>;
 }
 
 interface ClientSubscription {
@@ -217,6 +225,7 @@ export class InkDaemon {
 		this.clients.clear();
 
 		for (const [sessionId, runtime] of this.runtime.entries()) {
+			this.clearRuntimeActivityTimers(runtime);
 			if (runtime.previewBroadcastTimer) {
 				clearTimeout(runtime.previewBroadcastTimer);
 			}
@@ -432,6 +441,90 @@ export class InkDaemon {
 		}, PREVIEW_BROADCAST_DELAY_MS);
 	}
 
+	private clearRuntimeActivityTimers(runtime: RuntimeSession): void {
+		if (runtime.activityEvaluationTimer) {
+			clearTimeout(runtime.activityEvaluationTimer);
+			runtime.activityEvaluationTimer = undefined;
+		}
+		if (runtime.activityIdleTimer) {
+			clearTimeout(runtime.activityIdleTimer);
+			runtime.activityIdleTimer = undefined;
+		}
+	}
+
+	private changedCharacterCount(previous: string, next: string): number {
+		const maxLength = Math.max(previous.length, next.length);
+		let changed = Math.abs(previous.length - next.length);
+		const sharedLength = Math.min(previous.length, next.length);
+		for (let index = 0; index < sharedLength; index += 1) {
+			if (previous[index] !== next[index]) {
+				changed += 1;
+			}
+		}
+		return Math.min(changed, maxLength);
+	}
+
+	private scheduleActivityEvaluation(sessionId: string): void {
+		const runtime = this.runtime.get(sessionId);
+		if (!runtime || runtime.activityEvaluationTimer) {
+			return;
+		}
+		runtime.activityEvaluationTimer = setTimeout(() => {
+			runtime.activityEvaluationTimer = undefined;
+			void this.evaluatePreviewActivity(sessionId);
+		}, ACTIVITY_EVALUATION_DELAY_MS);
+	}
+
+	private async evaluatePreviewActivity(sessionId: string): Promise<void> {
+		const session = this.sessions.get(sessionId);
+		const runtime = this.runtime.get(sessionId);
+		if (!session || !runtime || session.status !== 'running') {
+			return;
+		}
+
+		const snapshot = await runtime.preview.getSnapshot();
+		const changedChars = this.changedCharacterCount(runtime.lastPreviewSnapshot, snapshot);
+		runtime.lastPreviewSnapshot = snapshot;
+		if (changedChars < ACTIVE_MIN_CHANGED_CHARS) {
+			return;
+		}
+
+		const now = Date.now();
+		runtime.previewChangeEvents = runtime.previewChangeEvents
+			.filter(event => now - event.at <= ACTIVITY_WINDOW_MS)
+			.concat({at: now, changedChars});
+		const recentChangedChars = runtime.previewChangeEvents.reduce((total, event) => total + event.changedChars, 0);
+		if (recentChangedChars >= ACTIVE_MIN_CHANGED_CHARS) {
+			await this.setAgentStatus(sessionId, 'active');
+		}
+
+		if (runtime.activityIdleTimer) {
+			clearTimeout(runtime.activityIdleTimer);
+		}
+		runtime.activityIdleTimer = setTimeout(() => {
+			runtime.activityIdleTimer = undefined;
+			runtime.previewChangeEvents = [];
+			void this.setAgentStatus(sessionId, 'idle');
+		}, IDLE_AFTER_MS);
+	}
+
+	private async setAgentStatus(sessionId: string, agentStatus: AgentActivityStatus): Promise<void> {
+		const session = this.sessions.get(sessionId);
+		if (!session || session.status === 'exited' || session.agentStatus === agentStatus) {
+			return;
+		}
+		const updated: SessionRecord = {
+			...session,
+			agentStatus,
+			agentStatusUpdatedAt: new Date().toISOString(),
+			updatedAt: session.updatedAt,
+		};
+		this.sessions.set(sessionId, updated);
+		await this.persist();
+		this.broadcastSessionUpdated(updated);
+		await this.broadcastPreview(sessionId);
+	}
+
 	private async broadcastPreview(sessionId: string): Promise<void> {
 		const session = this.sessions.get(sessionId);
 		if (!session) {
@@ -454,6 +547,7 @@ export class InkDaemon {
 			content,
 			live: session.status === 'running',
 			status: session.status,
+			agentStatus: session.agentStatus,
 		};
 	}
 
@@ -516,6 +610,8 @@ export class InkDaemon {
 			cwd: input.cwd,
 			repoRoot: input.repoRoot,
 			status: 'starting',
+			agentStatus: 'unknown',
+			agentStatusUpdatedAt: now,
 			createdAt: now,
 			updatedAt: now,
 			lastPreview: '',
@@ -552,12 +648,19 @@ export class InkDaemon {
 			term,
 			scrollback: '',
 			preview: new TerminalPreview(input.cols, input.rows),
+			lastPreviewSnapshot: '',
+			previewChangeEvents: [],
 		};
 		this.runtime.set(baseSession.id, runtime);
+		runtime.activityIdleTimer = setTimeout(() => {
+			runtime.activityIdleTimer = undefined;
+			void this.setAgentStatus(baseSession.id, 'idle');
+		}, IDLE_AFTER_MS);
 
 		term.onData(output => {
 			runtime.scrollback = clampScrollback(runtime.scrollback + output);
 			void runtime.preview.write(output);
+			this.scheduleActivityEvaluation(baseSession.id);
 			this.schedulePreviewBroadcast(baseSession.id);
 			if (runtime.attachedSocket && !runtime.attachedSocket.destroyed) {
 				sendMessage(runtime.attachedSocket, {type: 'output', sessionId: baseSession.id, data: output});
@@ -602,13 +705,19 @@ export class InkDaemon {
 		}
 		const runtime = this.runtime.get(sessionId);
 		this.runtime.delete(sessionId);
+		if (runtime) {
+			this.clearRuntimeActivityTimers(runtime);
+		}
 		if (runtime?.previewBroadcastTimer) {
 			clearTimeout(runtime.previewBroadcastTimer);
 		}
+		const now = new Date().toISOString();
 		const updated: SessionRecord = {
 			...existing,
 			status: 'exited',
-			updatedAt: new Date().toISOString(),
+			agentStatus: 'idle',
+			agentStatusUpdatedAt: now,
+			updatedAt: now,
 			exitCode,
 			exitSignal,
 			lastPreview: runtime ? await runtime.preview.getSnapshot() : existing.lastPreview,

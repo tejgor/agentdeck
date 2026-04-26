@@ -5,15 +5,17 @@ import {PreviewPane} from './preview.js';
 import {Sidebar} from './sidebar.js';
 import type {PreviewRecord, ProgramKey, SessionRecord, UiExitResult} from './types.js';
 
-const PROGRAMS: Array<{key: ProgramKey; label: string}> = [
-	{key: 'claude', label: 'Claude'},
-	{key: 'pi', label: 'Pi'},
+const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
+	{key: 'claude', label: 'Claude', glyph: '✶'},
+	{key: 'pi', label: 'Pi', glyph: 'π'},
 ];
 
 const EMPTY_PREVIEW: PreviewRecord = {
 	content: '',
 	live: false,
 };
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 type Mode = 'browse' | 'pick-program' | 'enter-name';
 
@@ -87,13 +89,17 @@ function CreatePane({
 }) {
 	return (
 		<Box flexDirection="column" width={width}>
-			<Text bold>{mode === 'pick-program' ? 'Create session' : `Create ${PROGRAMS[programIndex]!.label} session`}</Text>
+			<Text bold>
+				{mode === 'pick-program'
+					? 'Create session'
+					: `Create ${PROGRAMS[programIndex]!.glyph} ${PROGRAMS[programIndex]!.label} session`}
+			</Text>
 			{mode === 'pick-program' ? (
 				<>
 					<Text>Select agent:</Text>
 					{PROGRAMS.map((program, index) => (
 						<Text key={program.key} inverse={index === programIndex}>
-							{index === programIndex ? '›' : ' '} {program.label}
+							{index === programIndex ? '›' : ' '} {program.glyph} {program.label}
 						</Text>
 					))}
 					<Text dimColor>enter continue • esc cancel • arrows switch</Text>
@@ -121,6 +127,7 @@ export function App({repoRoot, cwd}: AppProps) {
 	const [client, setClient] = useState<LiveClient | undefined>();
 	const [connectionEpoch, setConnectionEpoch] = useState(0);
 	const [terminalSize, setTerminalSize] = useState<TerminalSize>(getTerminalSize());
+	const [spinnerIndex, setSpinnerIndex] = useState(0);
 	const selectedIdRef = useRef<string | undefined>(selectedId);
 
 	useEffect(() => {
@@ -134,6 +141,22 @@ export function App({repoRoot, cwd}: AppProps) {
 			process.stdout.off('resize', onResize);
 		};
 	}, []);
+
+	const shouldAnimateStatus = sessions.some(
+		session => session.status === 'starting' || (session.status === 'running' && session.agentStatus === 'active'),
+	);
+
+	useEffect(() => {
+		if (!shouldAnimateStatus) {
+			return;
+		}
+		const timer = setInterval(() => {
+			setSpinnerIndex(index => (index + 1) % SPINNER_FRAMES.length);
+		}, 120);
+		return () => {
+			clearInterval(timer);
+		};
+	}, [shouldAnimateStatus]);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -243,13 +266,25 @@ export function App({repoRoot, cwd}: AppProps) {
 			setPreview(EMPTY_PREVIEW);
 			return;
 		}
-		setPreview({
-			sessionId: selectedSession.id,
-			content: selectedSession.status === 'exited' ? selectedSession.lastPreview ?? '' : '',
-			live: false,
-			status: selectedSession.status,
+		setPreview(current => {
+			const sameSession = current.sessionId === selectedSession.id;
+			const content =
+				selectedSession.status === 'exited'
+					? selectedSession.lastPreview ?? current.content
+					: sameSession
+						? current.content
+						: '';
+			return {
+				sessionId: selectedSession.id,
+				content,
+				live: sameSession ? current.live : false,
+				status: selectedSession.status,
+				agentStatus: selectedSession.agentStatus,
+			};
 		});
 	}, [selectedSession]);
+
+	const spinnerFrame = SPINNER_FRAMES[spinnerIndex] ?? SPINNER_FRAMES[0]!;
 
 	const layout = useMemo(() => {
 		const totalWidth = terminalSize.cols;
@@ -474,6 +509,7 @@ export function App({repoRoot, cwd}: AppProps) {
 					selectedId={selectedSession?.id}
 					width={layout.sidebarWidth}
 					height={layout.contentHeight}
+					spinnerFrame={spinnerFrame}
 				/>
 				<Text dimColor> │ </Text>
 				{mode === 'browse' ? (
@@ -482,6 +518,7 @@ export function App({repoRoot, cwd}: AppProps) {
 						preview={preview}
 						width={layout.previewWidth}
 						height={layout.contentHeight}
+						spinnerFrame={spinnerFrame}
 					/>
 				) : (
 					<CreatePane
