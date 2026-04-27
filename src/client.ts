@@ -12,7 +12,7 @@ import {
 	getSocketPath,
 	isDevRuntime,
 } from './paths.js';
-import type {ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, SessionRecord, WorktreeInfoRecord} from './types.js';
+import type {ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, SessionRecord, TerminalRecord, WorktreeInfoRecord} from './types.js';
 
 function createConnection(): Promise<net.Socket> {
 	const socketPath = getSocketPath();
@@ -81,7 +81,7 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 8;
+const PROTOCOL_VERSION = 9;
 
 class ProtocolMismatchError extends Error {}
 
@@ -238,6 +238,7 @@ interface LiveClientHandlers {
 	onSessionUpdated?: (session: SessionRecord) => void;
 	onSessionRemoved?: (sessionId: string) => void;
 	onPreviewUpdated?: (preview: PreviewRecord) => void;
+	onTerminalUpdated?: (terminal: TerminalRecord) => void;
 	onError?: (error: Error) => void;
 	onClose?: () => void;
 }
@@ -277,6 +278,9 @@ export class LiveClient {
 						return;
 					case 'preview-updated':
 						this.handlers.onPreviewUpdated?.(message.preview);
+						return;
+					case 'terminal-updated':
+						this.handlers.onTerminalUpdated?.(message.terminal);
 						return;
 					default:
 						return;
@@ -325,6 +329,16 @@ export class LiveClient {
 	watchPreview(sessionId: string | undefined, cols: number, rows: number): Promise<PreviewRecord> {
 		return this.request<PreviewRecord>({
 			type: 'watch-preview',
+			requestId: randomUUID(),
+			sessionId,
+			cols,
+			rows,
+		});
+	}
+
+	watchTerminal(sessionId: string | undefined, cols: number, rows: number): Promise<TerminalRecord> {
+		return this.request<TerminalRecord>({
+			type: 'watch-terminal',
 			requestId: randomUUID(),
 			sessionId,
 			cols,

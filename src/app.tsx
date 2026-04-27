@@ -3,7 +3,9 @@ import {Box, Text, useApp, useInput} from 'ink';
 import {LiveClient, createLiveClient} from './client.js';
 import {PreviewPane} from './preview.js';
 import {Sidebar} from './sidebar.js';
-import type {PreviewRecord, ProgramKey, SessionRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
+import {TabBar} from './tabs.js';
+import {TerminalPane} from './terminalPane.js';
+import type {PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
 
 const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
 	{key: 'claude', label: 'Claude', glyph: '✶'},
@@ -11,6 +13,11 @@ const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
 ];
 
 const EMPTY_PREVIEW: PreviewRecord = {
+	content: '',
+	live: false,
+};
+
+const EMPTY_TERMINAL: TerminalRecord = {
 	content: '',
 	live: false,
 };
@@ -176,7 +183,9 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 	const [worktrees, setWorktrees] = useState<WorktreeInfoRecord[]>([]);
 	const [worktreeIndex, setWorktreeIndex] = useState(0);
 	const [killConfirmIndex, setKillConfirmIndex] = useState(0);
+	const [activeTab, setActiveTab] = useState<RightPaneTab>('preview');
 	const [preview, setPreview] = useState<PreviewRecord>(EMPTY_PREVIEW);
+	const [terminal, setTerminal] = useState<TerminalRecord>(EMPTY_TERMINAL);
 	const [error, setError] = useState<string | undefined>();
 	const [busy, setBusy] = useState(false);
 	const [client, setClient] = useState<LiveClient | undefined>();
@@ -243,6 +252,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 						setSessions(current => current.filter(session => session.id !== sessionId));
 						if (selectedIdRef.current === sessionId) {
 							setPreview(EMPTY_PREVIEW);
+							setTerminal(EMPTY_TERMINAL);
 						}
 					},
 					onPreviewUpdated: nextPreview => {
@@ -253,6 +263,15 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 							return;
 						}
 						setPreview(nextPreview);
+					},
+					onTerminalUpdated: nextTerminal => {
+						if (nextTerminal.sessionId && nextTerminal.sessionId !== selectedIdRef.current) {
+							return;
+						}
+						if (!nextTerminal.sessionId && selectedIdRef.current) {
+							return;
+						}
+						setTerminal(nextTerminal);
 					},
 					onError: nextError => {
 						setError(nextError.message);
@@ -332,8 +351,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 	useEffect(() => {
 		if (!selectedSession) {
 			setPreview(EMPTY_PREVIEW);
+			setTerminal(EMPTY_TERMINAL);
 			return;
 		}
+		setTerminal(current => (current.sessionId === selectedSession.id ? current : EMPTY_TERMINAL));
 		setPreview(current => {
 			const sameSession = current.sessionId === selectedSession.id;
 			const content =
@@ -362,11 +383,13 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		const rightWidth = Math.max(20, totalWidth - leftWidth - separatorWidth);
 		const footerLines = error ? 3 : 2;
 		const contentHeight = Math.max(8, totalHeight - 2 - footerLines);
-		const previewRows = Math.max(1, contentHeight - 2);
+		const paneHeight = Math.max(1, contentHeight - 1);
+		const previewRows = Math.max(1, paneHeight - 2);
 		return {
 			sidebarWidth: leftWidth,
 			previewWidth: rightWidth,
 			contentHeight,
+			paneHeight,
 			previewCols: rightWidth,
 			previewRows,
 		};
@@ -429,6 +452,32 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		};
 	}, [client, layout.previewCols, layout.previewRows, selectedId]);
 
+	useEffect(() => {
+		if (!client || activeTab !== 'terminal') {
+			return;
+		}
+		let cancelled = false;
+		void client
+			.watchTerminal(selectedId, layout.previewCols, layout.previewRows)
+			.then(nextTerminal => {
+				if (cancelled) {
+					return;
+				}
+				if (nextTerminal.sessionId && nextTerminal.sessionId !== selectedId) {
+					return;
+				}
+				setTerminal(nextTerminal);
+			})
+			.catch(nextError => {
+				if (!cancelled) {
+					setError(nextError instanceof Error ? nextError.message : String(nextError));
+				}
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeTab, client, layout.previewCols, layout.previewRows, selectedId]);
+
 	const submitCreate = useCallback(async (existingWorktreePath?: string) => {
 		const title = draftName.trim();
 		if (!title) {
@@ -489,6 +538,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		try {
 			await client.removeSession(selectedSession.id);
 			setPreview(EMPTY_PREVIEW);
+			setTerminal(EMPTY_TERMINAL);
 		} catch (nextError) {
 			setError(nextError instanceof Error ? nextError.message : String(nextError));
 		} finally {
@@ -536,6 +586,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				);
 				return;
 			}
+			if (key.tab) {
+				setActiveTab(tab => (tab === 'preview' ? 'terminal' : 'preview'));
+				return;
+			}
 			if (key.upArrow || input === 'k') {
 				moveSelection(-1);
 				return;
@@ -570,7 +624,13 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (key.return && selectedSession?.status === 'running') {
-				exit({kind: 'attach', sessionId: selectedSession.id} satisfies UiExitResult);
+				exit({
+					kind: 'attach',
+					sessionId: selectedSession.id,
+					target: activeTab === 'terminal' ? 'terminal' : 'agent',
+					title: selectedSession.title,
+					cwd: selectedSession.cwd,
+				} satisfies UiExitResult);
 			}
 			return;
 		}
@@ -701,13 +761,25 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				/>
 				<Text dimColor> │ </Text>
 				{mode === 'browse' ? (
-					<PreviewPane
-						session={selectedSession}
-						preview={preview}
-						width={layout.previewWidth}
-						height={layout.contentHeight}
-						spinnerFrame={spinnerFrame}
-					/>
+					<Box flexDirection="column" width={layout.previewWidth} height={layout.contentHeight}>
+						<TabBar activeTab={activeTab} width={layout.previewWidth} />
+						{activeTab === 'preview' ? (
+							<PreviewPane
+								session={selectedSession}
+								preview={preview}
+								width={layout.previewWidth}
+								height={layout.paneHeight}
+								spinnerFrame={spinnerFrame}
+							/>
+						) : (
+							<TerminalPane
+								session={selectedSession}
+								terminal={terminal}
+								width={layout.previewWidth}
+								height={layout.paneHeight}
+							/>
+						)}
+					</Box>
 				) : mode === 'pick-worktree' ? (
 					<WorktreePickerPane worktrees={worktrees} selectedIndex={worktreeIndex} width={layout.previewWidth} />
 				) : mode === 'confirm-kill' ? (
@@ -729,7 +801,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			</Box>
 			<Text dimColor>
 				{mode === 'browse'
-					? 'n new • enter attach • j/k move • h/l resize • x kill • s restart exited • d delete exited • r refresh • q quit'
+					? 'tab pane • enter attach active pane • Ctrl+Space return • n new • j/k move • h/l resize • x kill • s restart exited • d delete exited • r refresh • q quit'
 					: 'esc cancel'}
 			</Text>
 			{busy ? <Text color="yellow">Working…</Text> : null}

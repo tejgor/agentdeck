@@ -4,6 +4,8 @@ export type SessionStatus = 'starting' | 'running' | 'exited';
 export type AgentActivityStatus = 'unknown' | 'active' | 'idle';
 export type WorktreeMode = 'none' | 'new' | 'existing';
 export type SessionWorktreeMode = 'none' | 'managed' | 'attached';
+export type AttachTarget = 'agent' | 'terminal';
+export type RightPaneTab = 'preview' | 'terminal';
 
 export interface SessionWorktreeRecord {
 	mode: SessionWorktreeMode;
@@ -52,6 +54,15 @@ export interface PreviewRecord {
 	agentStatus?: AgentActivityStatus;
 }
 
+export interface TerminalRecord {
+	sessionId?: string;
+	content: string;
+	live: boolean;
+	cwd?: string;
+	exitCode?: number | null;
+	exitSignal?: number | null;
+}
+
 export interface CreateSessionInput {
 	title: string;
 	program: ProgramKey;
@@ -69,6 +80,7 @@ export type ClientRequest =
 	| {type: 'subscribe'; requestId: string; repoRoot: string}
 	| {type: 'list-worktrees'; requestId: string; cwd: string}
 	| {type: 'watch-preview'; requestId: string; sessionId?: string; cols: number; rows: number}
+	| {type: 'watch-terminal'; requestId: string; sessionId?: string; cols: number; rows: number}
 	| {type: 'create'; requestId: string; input: CreateSessionInput}
 	| {type: 'restart'; requestId: string; sessionId: string; cols: number; rows: number}
 	| {type: 'kill'; requestId: string; sessionId: string; deleteWorktree?: boolean}
@@ -76,7 +88,11 @@ export type ClientRequest =
 	| {type: 'attach'; requestId: string; sessionId: string}
 	| {type: 'input'; sessionId: string; data: string}
 	| {type: 'resize'; sessionId: string; cols: number; rows: number}
-	| {type: 'detach'; sessionId: string};
+	| {type: 'detach'; sessionId: string}
+	| {type: 'attach-terminal'; requestId: string; sessionId: string}
+	| {type: 'terminal-input'; sessionId: string; data: string}
+	| {type: 'terminal-resize'; sessionId: string; cols: number; rows: number}
+	| {type: 'terminal-detach'; sessionId: string};
 
 export type ServerResponse<T = unknown> = {
 	type: 'response';
@@ -91,11 +107,15 @@ export type ServerEvent =
 	| {type: 'session-updated'; session: SessionRecord}
 	| {type: 'session-removed'; sessionId: string}
 	| {type: 'preview-updated'; preview: PreviewRecord}
+	| {type: 'terminal-updated'; terminal: TerminalRecord}
+	| {type: 'terminal-output'; sessionId: string; data: string}
 	| {type: 'attached'; sessionId: string}
-	| {type: 'detached'; sessionId: string};
+	| {type: 'detached'; sessionId: string}
+	| {type: 'terminal-attached'; sessionId: string}
+	| {type: 'terminal-detached'; sessionId: string};
 
 export type ServerMessage = ServerResponse | ServerEvent;
 
 export type UiExitResult =
 	| {kind: 'quit'}
-	| {kind: 'attach'; sessionId: string};
+	| {kind: 'attach'; sessionId: string; target: AttachTarget; title?: string; cwd?: string};

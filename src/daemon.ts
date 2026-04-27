@@ -10,7 +10,7 @@ import {createWorktreeForSession, findRepoRoot, listWorktrees, removeWorktree} f
 import {ensureNodePtyReady} from './nodePty.js';
 import {ensureConfigDir, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {AgentActivityStatus, ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, ServerResponse, SessionRecord} from './types.js';
+import type {AgentActivityStatus, ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
@@ -22,7 +22,7 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 8;
+const PROTOCOL_VERSION = 9;
 
 interface RuntimeSession {
 	term: IPty;
@@ -38,11 +38,26 @@ interface RuntimeSession {
 	deleteWorktreeOnExit?: boolean;
 }
 
+interface RuntimeTerminal {
+	term: IPty;
+	scrollback: string;
+	preview: TerminalPreview;
+	attachedSocket?: net.Socket;
+	broadcastTimer?: NodeJS.Timeout;
+	cwd: string;
+	exited: boolean;
+	exitCode?: number | null;
+	exitSignal?: number | null;
+}
+
 interface ClientSubscription {
 	repoRoot?: string;
 	watchedPreviewSessionId?: string;
+	watchedTerminalSessionId?: string;
 	previewCols: number;
 	previewRows: number;
+	terminalCols: number;
+	terminalRows: number;
 }
 
 function sendMessage(socket: net.Socket, message: ServerMessage): void {
@@ -75,6 +90,10 @@ async function resolveProgramCommand(program: SessionRecord['program']): Promise
 	}
 }
 
+function resolveShellCommand(): string {
+	return process.env.SHELL || '/bin/sh';
+}
+
 function clampScrollback(value: string): string {
 	return value.length <= SCROLLBACK_LIMIT ? value : value.slice(-SCROLLBACK_LIMIT);
 }
@@ -89,6 +108,7 @@ function clampSize(value: number, fallback: number): number {
 export class InkDaemon {
 	private readonly sessions = new Map<string, SessionRecord>();
 	private readonly runtime = new Map<string, RuntimeSession>();
+	private readonly terminals = new Map<string, RuntimeTerminal>();
 	private readonly clients = new Map<net.Socket, ClientSubscription>();
 	private server?: net.Server;
 	private shuttingDown = false;
@@ -249,6 +269,18 @@ export class InkDaemon {
 			runtime.preview.dispose();
 		}
 		this.runtime.clear();
+		for (const terminal of this.terminals.values()) {
+			if (terminal.broadcastTimer) {
+				clearTimeout(terminal.broadcastTimer);
+			}
+			try {
+				terminal.term.kill();
+			} catch {
+				// ignore shutdown errors
+			}
+			terminal.preview.dispose();
+		}
+		this.terminals.clear();
 		await this.persist();
 
 		if (this.server) {
@@ -268,6 +300,8 @@ export class InkDaemon {
 		this.clients.set(socket, {
 			previewCols: DEFAULT_PREVIEW_COLS,
 			previewRows: DEFAULT_PREVIEW_ROWS,
+			terminalCols: DEFAULT_PREVIEW_COLS,
+			terminalRows: DEFAULT_PREVIEW_ROWS,
 		});
 
 		let buffer = '';
@@ -278,6 +312,10 @@ export class InkDaemon {
 				const runtime = this.runtime.get(attachedSessionId);
 				if (runtime?.attachedSocket === socket) {
 					runtime.attachedSocket = undefined;
+				}
+				const terminal = this.terminals.get(attachedSessionId);
+				if (terminal?.attachedSocket === socket) {
+					terminal.attachedSocket = undefined;
 				}
 				attachedSessionId = undefined;
 			}
@@ -314,6 +352,8 @@ export class InkDaemon {
 			const created: ClientSubscription = {
 				previewCols: DEFAULT_PREVIEW_COLS,
 				previewRows: DEFAULT_PREVIEW_ROWS,
+				terminalCols: DEFAULT_PREVIEW_COLS,
+				terminalRows: DEFAULT_PREVIEW_ROWS,
 			};
 			this.clients.set(socket, created);
 			return created;
@@ -351,6 +391,15 @@ export class InkDaemon {
 					client.previewRows = clampSize(message.rows, client.previewRows);
 					const preview = await this.getPreviewRecord(message.sessionId, client.previewCols, client.previewRows);
 					sendMessage(socket, response(message.requestId, preview));
+					return;
+				}
+				case 'watch-terminal': {
+					const client = this.getClient(socket);
+					client.watchedTerminalSessionId = message.sessionId;
+					client.terminalCols = clampSize(message.cols, client.terminalCols);
+					client.terminalRows = clampSize(message.rows, client.terminalRows);
+					const terminal = await this.getTerminalRecord(message.sessionId, client.terminalCols, client.terminalRows);
+					sendMessage(socket, response(message.requestId, terminal));
 					return;
 				}
 				case 'create': {
@@ -415,6 +464,47 @@ export class InkDaemon {
 					}
 					setAttachedSessionId(undefined);
 					sendMessage(socket, {type: 'detached', sessionId: message.sessionId});
+					return;
+				}
+				case 'attach-terminal': {
+					const terminal = await this.ensureTerminal(message.sessionId, DEFAULT_PREVIEW_COLS, DEFAULT_PREVIEW_ROWS);
+					if (terminal.attachedSocket && terminal.attachedSocket !== socket && !terminal.attachedSocket.destroyed) {
+						throw new Error('terminal is already attached elsewhere');
+					}
+					terminal.attachedSocket = socket;
+					setAttachedSessionId(message.sessionId);
+					sendMessage(socket, response(message.requestId, this.sessions.get(message.sessionId)));
+					sendMessage(socket, {type: 'terminal-attached', sessionId: message.sessionId});
+					if (terminal.scrollback) {
+						sendMessage(socket, {type: 'terminal-output', sessionId: message.sessionId, data: terminal.scrollback});
+					}
+					return;
+				}
+				case 'terminal-input': {
+					const terminal = this.terminals.get(message.sessionId);
+					if (terminal && !terminal.exited) {
+						terminal.term.write(message.data);
+					}
+					return;
+				}
+				case 'terminal-resize': {
+					const terminal = this.terminals.get(message.sessionId);
+					if (terminal && !terminal.exited) {
+						const cols = Math.max(1, message.cols);
+						const rows = Math.max(1, message.rows);
+						terminal.term.resize(cols, rows);
+						await terminal.preview.resize(cols, rows);
+						this.scheduleTerminalBroadcast(message.sessionId);
+					}
+					return;
+				}
+				case 'terminal-detach': {
+					const terminal = this.terminals.get(message.sessionId);
+					if (terminal?.attachedSocket === socket) {
+						terminal.attachedSocket = undefined;
+					}
+					setAttachedSessionId(undefined);
+					sendMessage(socket, {type: 'terminal-detached', sessionId: message.sessionId});
 					return;
 				}
 			}
@@ -597,6 +687,132 @@ export class InkDaemon {
 		}
 
 		return this.buildPreviewRecord(session, session.lastPreview ?? '');
+	}
+
+	private buildTerminalRecord(sessionId: string | undefined, terminal?: RuntimeTerminal): TerminalRecord {
+		return {
+			sessionId,
+			content: terminal?.preview.getCachedSnapshot() ?? '',
+			live: Boolean(terminal && !terminal.exited),
+			cwd: terminal?.cwd,
+			exitCode: terminal?.exitCode,
+			exitSignal: terminal?.exitSignal,
+		};
+	}
+
+	private scheduleTerminalBroadcast(sessionId: string): void {
+		const terminal = this.terminals.get(sessionId);
+		if (!terminal || terminal.broadcastTimer) {
+			return;
+		}
+		terminal.broadcastTimer = setTimeout(() => {
+			terminal.broadcastTimer = undefined;
+			void this.broadcastTerminal(sessionId);
+		}, PREVIEW_BROADCAST_DELAY_MS);
+	}
+
+	private async broadcastTerminal(sessionId: string): Promise<void> {
+		const terminal = this.terminals.get(sessionId);
+		if (terminal) {
+			await terminal.preview.getSnapshot();
+		}
+		for (const [socket, client] of this.clients.entries()) {
+			if (client.watchedTerminalSessionId !== sessionId) {
+				continue;
+			}
+			sendMessage(socket, {type: 'terminal-updated', terminal: this.buildTerminalRecord(sessionId, terminal)});
+		}
+	}
+
+	private async ensureTerminal(sessionId: string, cols: number, rows: number): Promise<RuntimeTerminal> {
+		const session = this.sessions.get(sessionId);
+		if (!session) {
+			throw new Error('session does not exist');
+		}
+		if (session.status === 'exited') {
+			throw new Error('cannot start terminal for exited session');
+		}
+
+		const existing = this.terminals.get(sessionId);
+		if (existing) {
+			if (existing.exited) {
+				this.cleanupTerminal(sessionId);
+			} else {
+				existing.term.resize(Math.max(1, cols), Math.max(1, rows));
+				await existing.preview.resize(cols, rows);
+				return existing;
+			}
+		}
+
+		const command = resolveShellCommand();
+		const term = pty.spawn(command, [], {
+			name: 'xterm-256color',
+			cwd: session.cwd,
+			env: {...process.env},
+			cols: Math.max(1, cols),
+			rows: Math.max(1, rows),
+		});
+		const terminal: RuntimeTerminal = {
+			term,
+			scrollback: '',
+			preview: new TerminalPreview(cols, rows),
+			cwd: session.cwd,
+			exited: false,
+		};
+		this.terminals.set(sessionId, terminal);
+
+		term.onData(output => {
+			terminal.scrollback = clampScrollback(terminal.scrollback + output);
+			void terminal.preview.write(output);
+			this.scheduleTerminalBroadcast(sessionId);
+			if (terminal.attachedSocket && !terminal.attachedSocket.destroyed) {
+				sendMessage(terminal.attachedSocket, {type: 'terminal-output', sessionId, data: output});
+			}
+		});
+
+		term.onExit(({exitCode, signal}) => {
+			terminal.exited = true;
+			terminal.exitCode = exitCode ?? null;
+			terminal.exitSignal = signal ?? null;
+			void this.broadcastTerminal(sessionId);
+		});
+
+		this.scheduleTerminalBroadcast(sessionId);
+		return terminal;
+	}
+
+	private cleanupTerminal(sessionId: string): void {
+		const terminal = this.terminals.get(sessionId);
+		if (!terminal) {
+			return;
+		}
+		this.terminals.delete(sessionId);
+		if (terminal.broadcastTimer) {
+			clearTimeout(terminal.broadcastTimer);
+		}
+		try {
+			terminal.term.kill();
+		} catch {
+			// ignore cleanup errors
+		}
+		terminal.preview.dispose();
+	}
+
+	private async getTerminalRecord(sessionId: string | undefined, cols: number, rows: number): Promise<TerminalRecord> {
+		if (!sessionId) {
+			return {content: '', live: false};
+		}
+		const session = this.sessions.get(sessionId);
+		if (!session) {
+			return {sessionId, content: '', live: false};
+		}
+		if (session.status === 'exited') {
+			return {sessionId, content: '', live: false, cwd: session.cwd};
+		}
+		const terminal = await this.ensureTerminal(sessionId, cols, rows);
+		await terminal.preview.resize(cols, rows);
+		await terminal.preview.getSnapshot();
+		return this.buildTerminalRecord(sessionId, terminal);
 	}
 
 	private async createSession(input: CreateSessionInput): Promise<SessionRecord> {
@@ -855,6 +1071,7 @@ export class InkDaemon {
 			}
 			runtime.deleteWorktreeOnExit = true;
 		}
+		this.cleanupTerminal(sessionId);
 		runtime.term.kill();
 	}
 
@@ -866,6 +1083,7 @@ export class InkDaemon {
 		if (this.runtime.has(sessionId) || existing.status === 'running') {
 			throw new Error('kill the session before removing it');
 		}
+		this.cleanupTerminal(sessionId);
 		this.sessions.delete(sessionId);
 		await this.persist();
 		this.broadcastSessionRemoved(sessionId, existing.repoRoot);
@@ -878,6 +1096,7 @@ export class InkDaemon {
 		}
 		const runtime = this.runtime.get(sessionId);
 		this.runtime.delete(sessionId);
+		this.cleanupTerminal(sessionId);
 		if (runtime) {
 			this.clearRuntimeActivityTimers(runtime);
 		}

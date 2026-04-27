@@ -7,6 +7,12 @@ import {InkDaemon} from './daemon.js';
 import {ensureGitRepo} from './git.js';
 import type {UiExitResult} from './types.js';
 
+function clearTerminalScreen(): void {
+	if (process.stdout.isTTY) {
+		process.stdout.write('\x1b[2J\x1b[H');
+	}
+}
+
 async function runUi(sidebarWidth: {current?: number}): Promise<UiExitResult | undefined> {
 	const repoRoot = await ensureGitRepo(process.cwd());
 	const instance = render(
@@ -23,7 +29,13 @@ async function runUi(sidebarWidth: {current?: number}): Promise<UiExitResult | u
 			patchConsole: false,
 		},
 	);
-	return instance.waitUntilExit() as Promise<UiExitResult | undefined>;
+	try {
+		return (await instance.waitUntilExit()) as UiExitResult | undefined;
+	} finally {
+		instance.clear();
+		instance.cleanup();
+		clearTerminalScreen();
+	}
 }
 
 async function main(): Promise<void> {
@@ -41,7 +53,9 @@ async function main(): Promise<void> {
 			return;
 		}
 		if (result.kind === 'attach') {
-			await attachSession(result.sessionId);
+			clearTerminalScreen();
+			await attachSession(result.sessionId, result.target, {title: result.title, cwd: result.cwd});
+			clearTerminalScreen();
 		}
 	}
 }
