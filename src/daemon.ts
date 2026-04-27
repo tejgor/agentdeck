@@ -10,7 +10,7 @@ import {createWorktreeForSession, findRepoRoot, listWorktrees, removeWorktree} f
 import {ensureNodePtyReady} from './nodePty.js';
 import {ensureConfigDir, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {AgentActivityStatus, ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
+import type {AgentActivityStatus, ClientRequest, CreateSessionInput, GitRecord, PreviewRecord, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
@@ -22,7 +22,7 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 9;
+const PROTOCOL_VERSION = 10;
 
 interface RuntimeSession {
 	term: IPty;
@@ -54,10 +54,13 @@ interface ClientSubscription {
 	repoRoot?: string;
 	watchedPreviewSessionId?: string;
 	watchedTerminalSessionId?: string;
+	watchedGitSessionId?: string;
 	previewCols: number;
 	previewRows: number;
 	terminalCols: number;
 	terminalRows: number;
+	gitCols: number;
+	gitRows: number;
 }
 
 function sendMessage(socket: net.Socket, message: ServerMessage): void {
@@ -94,6 +97,20 @@ function resolveShellCommand(): string {
 	return process.env.SHELL || '/bin/sh';
 }
 
+async function resolveLazyGitCommand(): Promise<string> {
+	const shell = process.env.SHELL || '/bin/bash';
+	try {
+		const {stdout} = await execFileAsync(shell, ['-ic', 'command -v lazygit']);
+		const resolved = stdout.trim();
+		if (resolved) {
+			return resolved;
+		}
+	} catch {
+		// handled below
+	}
+	throw new Error('lazygit is not installed or not on PATH');
+}
+
 function clampScrollback(value: string): string {
 	return value.length <= SCROLLBACK_LIMIT ? value : value.slice(-SCROLLBACK_LIMIT);
 }
@@ -109,6 +126,7 @@ export class InkDaemon {
 	private readonly sessions = new Map<string, SessionRecord>();
 	private readonly runtime = new Map<string, RuntimeSession>();
 	private readonly terminals = new Map<string, RuntimeTerminal>();
+	private readonly gits = new Map<string, RuntimeTerminal>();
 	private readonly clients = new Map<net.Socket, ClientSubscription>();
 	private server?: net.Server;
 	private shuttingDown = false;
@@ -281,6 +299,18 @@ export class InkDaemon {
 			terminal.preview.dispose();
 		}
 		this.terminals.clear();
+		for (const git of this.gits.values()) {
+			if (git.broadcastTimer) {
+				clearTimeout(git.broadcastTimer);
+			}
+			try {
+				git.term.kill();
+			} catch {
+				// ignore shutdown errors
+			}
+			git.preview.dispose();
+		}
+		this.gits.clear();
 		await this.persist();
 
 		if (this.server) {
@@ -302,6 +332,8 @@ export class InkDaemon {
 			previewRows: DEFAULT_PREVIEW_ROWS,
 			terminalCols: DEFAULT_PREVIEW_COLS,
 			terminalRows: DEFAULT_PREVIEW_ROWS,
+			gitCols: DEFAULT_PREVIEW_COLS,
+			gitRows: DEFAULT_PREVIEW_ROWS,
 		});
 
 		let buffer = '';
@@ -316,6 +348,10 @@ export class InkDaemon {
 				const terminal = this.terminals.get(attachedSessionId);
 				if (terminal?.attachedSocket === socket) {
 					terminal.attachedSocket = undefined;
+				}
+				const git = this.gits.get(attachedSessionId);
+				if (git?.attachedSocket === socket) {
+					git.attachedSocket = undefined;
 				}
 				attachedSessionId = undefined;
 			}
@@ -354,6 +390,8 @@ export class InkDaemon {
 				previewRows: DEFAULT_PREVIEW_ROWS,
 				terminalCols: DEFAULT_PREVIEW_COLS,
 				terminalRows: DEFAULT_PREVIEW_ROWS,
+				gitCols: DEFAULT_PREVIEW_COLS,
+				gitRows: DEFAULT_PREVIEW_ROWS,
 			};
 			this.clients.set(socket, created);
 			return created;
@@ -400,6 +438,15 @@ export class InkDaemon {
 					client.terminalRows = clampSize(message.rows, client.terminalRows);
 					const terminal = await this.getTerminalRecord(message.sessionId, client.terminalCols, client.terminalRows);
 					sendMessage(socket, response(message.requestId, terminal));
+					return;
+				}
+				case 'watch-git': {
+					const client = this.getClient(socket);
+					client.watchedGitSessionId = message.sessionId;
+					client.gitCols = clampSize(message.cols, client.gitCols);
+					client.gitRows = clampSize(message.rows, client.gitRows);
+					const git = await this.getGitRecord(message.sessionId, client.gitCols, client.gitRows);
+					sendMessage(socket, response(message.requestId, git));
 					return;
 				}
 				case 'create': {
@@ -467,7 +514,11 @@ export class InkDaemon {
 					return;
 				}
 				case 'attach-terminal': {
-					const terminal = await this.ensureTerminal(message.sessionId, DEFAULT_PREVIEW_COLS, DEFAULT_PREVIEW_ROWS);
+					const terminal = await this.ensureTerminal(
+						message.sessionId,
+						clampSize(message.cols ?? DEFAULT_PREVIEW_COLS, DEFAULT_PREVIEW_COLS),
+						clampSize(message.rows ?? DEFAULT_PREVIEW_ROWS, DEFAULT_PREVIEW_ROWS),
+					);
 					if (terminal.attachedSocket && terminal.attachedSocket !== socket && !terminal.attachedSocket.destroyed) {
 						throw new Error('terminal is already attached elsewhere');
 					}
@@ -505,6 +556,51 @@ export class InkDaemon {
 					}
 					setAttachedSessionId(undefined);
 					sendMessage(socket, {type: 'terminal-detached', sessionId: message.sessionId});
+					return;
+				}
+				case 'attach-git': {
+					const git = await this.ensureGit(
+						message.sessionId,
+						clampSize(message.cols ?? DEFAULT_PREVIEW_COLS, DEFAULT_PREVIEW_COLS),
+						clampSize(message.rows ?? DEFAULT_PREVIEW_ROWS, DEFAULT_PREVIEW_ROWS),
+					);
+					if (git.attachedSocket && git.attachedSocket !== socket && !git.attachedSocket.destroyed) {
+						throw new Error('git is already attached elsewhere');
+					}
+					git.attachedSocket = socket;
+					setAttachedSessionId(message.sessionId);
+					sendMessage(socket, response(message.requestId, this.sessions.get(message.sessionId)));
+					sendMessage(socket, {type: 'git-attached', sessionId: message.sessionId});
+					if (git.scrollback) {
+						sendMessage(socket, {type: 'git-output', sessionId: message.sessionId, data: git.scrollback});
+					}
+					return;
+				}
+				case 'git-input': {
+					const git = this.gits.get(message.sessionId);
+					if (git && !git.exited) {
+						git.term.write(message.data);
+					}
+					return;
+				}
+				case 'git-resize': {
+					const git = this.gits.get(message.sessionId);
+					if (git && !git.exited) {
+						const cols = Math.max(1, message.cols);
+						const rows = Math.max(1, message.rows);
+						git.term.resize(cols, rows);
+						await git.preview.resize(cols, rows);
+						this.scheduleGitBroadcast(message.sessionId);
+					}
+					return;
+				}
+				case 'git-detach': {
+					const git = this.gits.get(message.sessionId);
+					if (git?.attachedSocket === socket) {
+						git.attachedSocket = undefined;
+					}
+					setAttachedSessionId(undefined);
+					sendMessage(socket, {type: 'git-detached', sessionId: message.sessionId});
 					return;
 				}
 			}
@@ -815,6 +911,132 @@ export class InkDaemon {
 		return this.buildTerminalRecord(sessionId, terminal);
 	}
 
+	private buildGitRecord(sessionId: string | undefined, git?: RuntimeTerminal): GitRecord {
+		return {
+			sessionId,
+			content: git?.preview.getCachedSnapshot() ?? '',
+			live: Boolean(git && !git.exited),
+			cwd: git?.cwd,
+			exitCode: git?.exitCode,
+			exitSignal: git?.exitSignal,
+		};
+	}
+
+	private scheduleGitBroadcast(sessionId: string): void {
+		const git = this.gits.get(sessionId);
+		if (!git || git.broadcastTimer) {
+			return;
+		}
+		git.broadcastTimer = setTimeout(() => {
+			git.broadcastTimer = undefined;
+			void this.broadcastGit(sessionId);
+		}, PREVIEW_BROADCAST_DELAY_MS);
+	}
+
+	private async broadcastGit(sessionId: string): Promise<void> {
+		const git = this.gits.get(sessionId);
+		if (git) {
+			await git.preview.getSnapshot();
+		}
+		for (const [socket, client] of this.clients.entries()) {
+			if (client.watchedGitSessionId !== sessionId) {
+				continue;
+			}
+			sendMessage(socket, {type: 'git-updated', git: this.buildGitRecord(sessionId, git)});
+		}
+	}
+
+	private async ensureGit(sessionId: string, cols: number, rows: number): Promise<RuntimeTerminal> {
+		const session = this.sessions.get(sessionId);
+		if (!session) {
+			throw new Error('session does not exist');
+		}
+		if (session.status === 'exited') {
+			throw new Error('cannot start lazygit for exited session');
+		}
+
+		const existing = this.gits.get(sessionId);
+		if (existing) {
+			if (existing.exited) {
+				this.cleanupGit(sessionId);
+			} else {
+				existing.term.resize(Math.max(1, cols), Math.max(1, rows));
+				await existing.preview.resize(cols, rows);
+				return existing;
+			}
+		}
+
+		const command = await resolveLazyGitCommand();
+		const term = pty.spawn(command, [], {
+			name: 'xterm-256color',
+			cwd: session.cwd,
+			env: {...process.env},
+			cols: Math.max(1, cols),
+			rows: Math.max(1, rows),
+		});
+		const git: RuntimeTerminal = {
+			term,
+			scrollback: '',
+			preview: new TerminalPreview(cols, rows),
+			cwd: session.cwd,
+			exited: false,
+		};
+		this.gits.set(sessionId, git);
+
+		term.onData(output => {
+			git.scrollback = clampScrollback(git.scrollback + output);
+			void git.preview.write(output);
+			this.scheduleGitBroadcast(sessionId);
+			if (git.attachedSocket && !git.attachedSocket.destroyed) {
+				sendMessage(git.attachedSocket, {type: 'git-output', sessionId, data: output});
+			}
+		});
+
+		term.onExit(({exitCode, signal}) => {
+			git.exited = true;
+			git.exitCode = exitCode ?? null;
+			git.exitSignal = signal ?? null;
+			void this.broadcastGit(sessionId);
+		});
+
+		this.scheduleGitBroadcast(sessionId);
+		return git;
+	}
+
+	private cleanupGit(sessionId: string): void {
+		const git = this.gits.get(sessionId);
+		if (!git) {
+			return;
+		}
+		this.gits.delete(sessionId);
+		if (git.broadcastTimer) {
+			clearTimeout(git.broadcastTimer);
+		}
+		try {
+			git.term.kill();
+		} catch {
+			// ignore cleanup errors
+		}
+		git.preview.dispose();
+	}
+
+	private async getGitRecord(sessionId: string | undefined, cols: number, rows: number): Promise<GitRecord> {
+		if (!sessionId) {
+			return {content: '', live: false};
+		}
+		const session = this.sessions.get(sessionId);
+		if (!session) {
+			return {sessionId, content: '', live: false};
+		}
+		if (session.status === 'exited') {
+			return {sessionId, content: '', live: false, cwd: session.cwd};
+		}
+		const git = await this.ensureGit(sessionId, cols, rows);
+		await git.preview.resize(cols, rows);
+		await git.preview.getSnapshot();
+		return this.buildGitRecord(sessionId, git);
+	}
+
 	private async createSession(input: CreateSessionInput): Promise<SessionRecord> {
 		const title = input.title.trim();
 		if (!title) {
@@ -1072,6 +1294,7 @@ export class InkDaemon {
 			runtime.deleteWorktreeOnExit = true;
 		}
 		this.cleanupTerminal(sessionId);
+		this.cleanupGit(sessionId);
 		runtime.term.kill();
 	}
 
@@ -1084,6 +1307,7 @@ export class InkDaemon {
 			throw new Error('kill the session before removing it');
 		}
 		this.cleanupTerminal(sessionId);
+		this.cleanupGit(sessionId);
 		this.sessions.delete(sessionId);
 		await this.persist();
 		this.broadcastSessionRemoved(sessionId, existing.repoRoot);
@@ -1097,6 +1321,7 @@ export class InkDaemon {
 		const runtime = this.runtime.get(sessionId);
 		this.runtime.delete(sessionId);
 		this.cleanupTerminal(sessionId);
+		this.cleanupGit(sessionId);
 		if (runtime) {
 			this.clearRuntimeActivityTimers(runtime);
 		}

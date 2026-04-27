@@ -12,7 +12,7 @@ import {
 	getSocketPath,
 	isDevRuntime,
 } from './paths.js';
-import type {ClientRequest, CreateSessionInput, PreviewRecord, ServerMessage, SessionRecord, TerminalRecord, WorktreeInfoRecord} from './types.js';
+import type {ClientRequest, CreateSessionInput, GitRecord, PreviewRecord, ServerMessage, SessionRecord, TerminalRecord, WorktreeInfoRecord} from './types.js';
 
 function createConnection(): Promise<net.Socket> {
 	const socketPath = getSocketPath();
@@ -81,7 +81,7 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 9;
+const PROTOCOL_VERSION = 10;
 
 class ProtocolMismatchError extends Error {}
 
@@ -239,6 +239,7 @@ interface LiveClientHandlers {
 	onSessionRemoved?: (sessionId: string) => void;
 	onPreviewUpdated?: (preview: PreviewRecord) => void;
 	onTerminalUpdated?: (terminal: TerminalRecord) => void;
+	onGitUpdated?: (git: GitRecord) => void;
 	onError?: (error: Error) => void;
 	onClose?: () => void;
 }
@@ -281,6 +282,9 @@ export class LiveClient {
 						return;
 					case 'terminal-updated':
 						this.handlers.onTerminalUpdated?.(message.terminal);
+						return;
+					case 'git-updated':
+						this.handlers.onGitUpdated?.(message.git);
 						return;
 					default:
 						return;
@@ -339,6 +343,16 @@ export class LiveClient {
 	watchTerminal(sessionId: string | undefined, cols: number, rows: number): Promise<TerminalRecord> {
 		return this.request<TerminalRecord>({
 			type: 'watch-terminal',
+			requestId: randomUUID(),
+			sessionId,
+			cols,
+			rows,
+		});
+	}
+
+	watchGit(sessionId: string | undefined, cols: number, rows: number): Promise<GitRecord> {
+		return this.request<GitRecord>({
+			type: 'watch-git',
 			requestId: randomUUID(),
 			sessionId,
 			cols,

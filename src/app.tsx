@@ -1,11 +1,12 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Box, Text, useApp, useInput} from 'ink';
 import {LiveClient, createLiveClient} from './client.js';
+import {GitPane} from './gitPane.js';
 import {PreviewPane} from './preview.js';
 import {Sidebar} from './sidebar.js';
 import {TabBar} from './tabs.js';
 import {TerminalPane} from './terminalPane.js';
-import type {PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
+import type {GitRecord, PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
 
 const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
 	{key: 'claude', label: 'Claude', glyph: '✶'},
@@ -22,6 +23,11 @@ const EMPTY_TERMINAL: TerminalRecord = {
 	live: false,
 };
 
+const EMPTY_GIT: GitRecord = {
+	content: '',
+	live: false,
+};
+
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const WORKTREE_MODES: Array<{key: WorktreeMode; label: string}> = [
 	{key: 'none', label: 'no worktree'},
@@ -29,7 +35,7 @@ const WORKTREE_MODES: Array<{key: WorktreeMode; label: string}> = [
 	{key: 'existing', label: 'existing worktree'},
 ];
 
-type Mode = 'browse' | 'pick-program' | 'enter-name' | 'pick-worktree' | 'confirm-kill';
+type Mode = 'browse' | 'pick-program' | 'enter-name' | 'pick-worktree' | 'confirm-kill' | 'help';
 
 interface AppProps {
 	repoRoot: string;
@@ -172,6 +178,55 @@ function KillConfirmPane({session, selectedIndex, canDelete, width}: {session?: 
 	);
 }
 
+function HelpPane({width}: {width: number}) {
+	const rows = [
+		['tab', 'cycle Preview / Terminal / Git'],
+		['o', 'attach active pane'],
+		['Ctrl+Space', 'return from attach'],
+		['n', 'new session'],
+		['j/k', 'move selection'],
+		['h/l', 'resize sidebar'],
+		['x', 'kill running session'],
+		['s', 'restart exited session'],
+		['d/delete', 'remove exited session'],
+		['r', 'refresh sessions'],
+		['q', 'quit'],
+		['esc/?', 'close help'],
+	];
+	return (
+		<Box flexDirection="column" width={width}>
+			<Text bold>Keyboard shortcuts</Text>
+			<Text dimColor>Browse mode</Text>
+			{rows.map(([key, description]) => (
+				<Text key={key}>
+					<Text color="cyan">{key.padEnd(12)}</Text> {description}
+				</Text>
+			))}
+		</Box>
+	);
+}
+
+function footerHint(mode: Mode, activeTab: RightPaneTab, session?: SessionRecord): string {
+	if (mode === 'browse') {
+		const attach = session?.status === 'running' ? 'o attach' : undefined;
+		const lifecycle = session?.status === 'exited' ? 's restart • d delete' : session?.status === 'running' ? 'x kill' : undefined;
+		return ['tab pane', attach, 'j/k move', 'h/l resize', lifecycle, '? help', 'q quit'].filter(Boolean).join(' • ');
+	}
+	if (mode === 'pick-program') {
+		return 'enter continue • esc cancel • j/k switch';
+	}
+	if (mode === 'enter-name') {
+		return 'tab worktree mode • enter create • esc back • backspace delete';
+	}
+	if (mode === 'pick-worktree') {
+		return 'enter select • esc back • j/k move';
+	}
+	if (mode === 'confirm-kill') {
+		return 'enter choose • esc cancel • j/k move';
+	}
+	return `${activeTab} shortcuts • esc/? close`;
+}
+
 export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: AppProps) {
 	const {exit} = useApp();
 	const [mode, setMode] = useState<Mode>('browse');
@@ -186,6 +241,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 	const [activeTab, setActiveTab] = useState<RightPaneTab>('preview');
 	const [preview, setPreview] = useState<PreviewRecord>(EMPTY_PREVIEW);
 	const [terminal, setTerminal] = useState<TerminalRecord>(EMPTY_TERMINAL);
+	const [git, setGit] = useState<GitRecord>(EMPTY_GIT);
 	const [error, setError] = useState<string | undefined>();
 	const [busy, setBusy] = useState(false);
 	const [client, setClient] = useState<LiveClient | undefined>();
@@ -253,6 +309,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 						if (selectedIdRef.current === sessionId) {
 							setPreview(EMPTY_PREVIEW);
 							setTerminal(EMPTY_TERMINAL);
+							setGit(EMPTY_GIT);
 						}
 					},
 					onPreviewUpdated: nextPreview => {
@@ -272,6 +329,15 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 							return;
 						}
 						setTerminal(nextTerminal);
+					},
+					onGitUpdated: nextGit => {
+						if (nextGit.sessionId && nextGit.sessionId !== selectedIdRef.current) {
+							return;
+						}
+						if (!nextGit.sessionId && selectedIdRef.current) {
+							return;
+						}
+						setGit(nextGit);
 					},
 					onError: nextError => {
 						setError(nextError.message);
@@ -352,9 +418,11 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		if (!selectedSession) {
 			setPreview(EMPTY_PREVIEW);
 			setTerminal(EMPTY_TERMINAL);
+			setGit(EMPTY_GIT);
 			return;
 		}
 		setTerminal(current => (current.sessionId === selectedSession.id ? current : EMPTY_TERMINAL));
+		setGit(current => (current.sessionId === selectedSession.id ? current : EMPTY_GIT));
 		setPreview(current => {
 			const sameSession = current.sessionId === selectedSession.id;
 			const content =
@@ -478,6 +546,32 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		};
 	}, [activeTab, client, layout.previewCols, layout.previewRows, selectedId]);
 
+	useEffect(() => {
+		if (!client || activeTab !== 'git') {
+			return;
+		}
+		let cancelled = false;
+		void client
+			.watchGit(selectedId, layout.previewCols, layout.previewRows)
+			.then(nextGit => {
+				if (cancelled) {
+					return;
+				}
+				if (nextGit.sessionId && nextGit.sessionId !== selectedId) {
+					return;
+				}
+				setGit(nextGit);
+			})
+			.catch(nextError => {
+				if (!cancelled) {
+					setError(nextError instanceof Error ? nextError.message : String(nextError));
+				}
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeTab, client, layout.previewCols, layout.previewRows, selectedId]);
+
 	const submitCreate = useCallback(async (existingWorktreePath?: string) => {
 		const title = draftName.trim();
 		if (!title) {
@@ -539,6 +633,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			await client.removeSession(selectedSession.id);
 			setPreview(EMPTY_PREVIEW);
 			setTerminal(EMPTY_TERMINAL);
+			setGit(EMPTY_GIT);
 		} catch (nextError) {
 			setError(nextError instanceof Error ? nextError.message : String(nextError));
 		} finally {
@@ -568,9 +663,20 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			return;
 		}
 
+		if (mode === 'help') {
+			if (key.escape || input === '?') {
+				setMode('browse');
+			}
+			return;
+		}
+
 		if (mode === 'browse') {
 			if (input === 'q') {
 				exit({kind: 'quit'} satisfies UiExitResult);
+				return;
+			}
+			if (input === '?') {
+				setMode('help');
 				return;
 			}
 			if (input === 'n') {
@@ -587,7 +693,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (key.tab) {
-				setActiveTab(tab => (tab === 'preview' ? 'terminal' : 'preview'));
+				setActiveTab(tab => (tab === 'preview' ? 'terminal' : tab === 'terminal' ? 'git' : 'preview'));
 				return;
 			}
 			if (key.upArrow || input === 'k') {
@@ -623,11 +729,11 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				void restartSelected();
 				return;
 			}
-			if (key.return && selectedSession?.status === 'running') {
+			if (input === 'o' && selectedSession?.status === 'running') {
 				exit({
 					kind: 'attach',
 					sessionId: selectedSession.id,
-					target: activeTab === 'terminal' ? 'terminal' : 'agent',
+					target: activeTab === 'terminal' ? 'terminal' : activeTab === 'git' ? 'git' : 'agent',
 					title: selectedSession.title,
 					cwd: selectedSession.cwd,
 				} satisfies UiExitResult);
@@ -771,15 +877,19 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 								height={layout.paneHeight}
 								spinnerFrame={spinnerFrame}
 							/>
-						) : (
+						) : activeTab === 'terminal' ? (
 							<TerminalPane
 								session={selectedSession}
 								terminal={terminal}
 								width={layout.previewWidth}
 								height={layout.paneHeight}
 							/>
+						) : (
+							<GitPane session={selectedSession} git={git} width={layout.previewWidth} height={layout.paneHeight} />
 						)}
 					</Box>
+				) : mode === 'help' ? (
+					<HelpPane width={layout.previewWidth} />
 				) : mode === 'pick-worktree' ? (
 					<WorktreePickerPane worktrees={worktrees} selectedIndex={worktreeIndex} width={layout.previewWidth} />
 				) : mode === 'confirm-kill' ? (
@@ -799,11 +909,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 					/>
 				)}
 			</Box>
-			<Text dimColor>
-				{mode === 'browse'
-					? 'tab pane • enter attach active pane • Ctrl+Space return • n new • j/k move • h/l resize • x kill • s restart exited • d delete exited • r refresh • q quit'
-					: 'esc cancel'}
-			</Text>
+			<Text dimColor>{footerHint(mode, activeTab, selectedSession)}</Text>
 			{busy ? <Text color="yellow">Working…</Text> : null}
 			{error ? <Text color="red">Error: {error}</Text> : null}
 		</Box>

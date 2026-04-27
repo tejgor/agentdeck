@@ -16,11 +16,38 @@ function clearTerminalScreen(): void {
 }
 
 function attachTargetLabel(target: AttachTarget): string {
-	return target === 'terminal' ? 'Terminal' : 'Agent';
+	return target === 'terminal' ? 'Terminal' : target === 'git' ? 'Git' : 'Agent';
 }
 
-function delay(ms: number): Promise<void> {
-	return new Promise(resolve => setTimeout(resolve, ms));
+function targetRequestNames(target: AttachTarget) {
+	if (target === 'terminal') {
+		return {
+			attach: 'attach-terminal',
+			input: 'terminal-input',
+			resize: 'terminal-resize',
+			detach: 'terminal-detach',
+			output: 'terminal-output',
+			detached: 'terminal-detached',
+		} as const;
+	}
+	if (target === 'git') {
+		return {
+			attach: 'attach-git',
+			input: 'git-input',
+			resize: 'git-resize',
+			detach: 'git-detach',
+			output: 'git-output',
+			detached: 'git-detached',
+		} as const;
+	}
+	return {
+		attach: 'attach',
+		input: 'input',
+		resize: 'resize',
+		detach: 'detach',
+		output: 'output',
+		detached: 'detached',
+	} as const;
 }
 
 function compactPath(value: string | undefined, maxLength: number): string | undefined {
@@ -57,9 +84,9 @@ function writeAttachBanner(sessionId: string, target: AttachTarget, options: Att
 
 export async function attachSession(sessionId: string, target: AttachTarget = 'agent', options: AttachSessionOptions = {}): Promise<void> {
 	writeAttachBanner(sessionId, target, options);
-	await delay(650);
 	const socket = await openPersistentConnection();
 	const requestId = randomUUID();
+	const names = targetRequestNames(target);
 	let attached = false;
 	let cleanedUp = false;
 
@@ -97,7 +124,7 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 
 		const onResize = () => {
 			writeMessage(socket, {
-				type: target === 'terminal' ? 'terminal-resize' : 'resize',
+				type: names.resize,
 				sessionId,
 				cols: process.stdout.columns || 80,
 				rows: process.stdout.rows || 24,
@@ -107,11 +134,11 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 		const onInput = (data: Buffer | string) => {
 			const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
 			if (chunk.includes(0x00)) {
-				writeMessage(socket, {type: target === 'terminal' ? 'terminal-detach' : 'detach', sessionId});
+				writeMessage(socket, {type: names.detach, sessionId});
 				finish();
 				return;
 			}
-			writeMessage(socket, {type: target === 'terminal' ? 'terminal-input' : 'input', sessionId, data: chunk.toString('utf8')});
+			writeMessage(socket, {type: names.input, sessionId, data: chunk.toString('utf8')});
 		};
 
 		const stopParsing = attachJsonParser(socket, message => {
@@ -131,7 +158,7 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 				return;
 			}
 
-			if ((message.type === 'output' || message.type === 'terminal-output') && message.sessionId === sessionId) {
+			if (message.type === names.output && message.sessionId === sessionId) {
 				process.stdout.write(message.data);
 				return;
 			}
@@ -145,7 +172,7 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 				return;
 			}
 
-			if ((message.type === 'detached' || message.type === 'terminal-detached') && message.sessionId === sessionId) {
+			if (message.type === names.detached && message.sessionId === sessionId) {
 				finish();
 			}
 		});
@@ -157,6 +184,12 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 			}
 		});
 
-		writeMessage(socket, {type: target === 'terminal' ? 'attach-terminal' : 'attach', requestId, sessionId});
+		writeMessage(socket, {
+			type: names.attach,
+			requestId,
+			sessionId,
+			cols: process.stdout.columns || 80,
+			rows: process.stdout.rows || 24,
+		});
 	});
 }

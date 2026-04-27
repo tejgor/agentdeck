@@ -5,6 +5,7 @@ import type {RightPaneTab} from './types.js';
 const TABS: Array<{key: RightPaneTab; label: string}> = [
 	{key: 'preview', label: 'Preview'},
 	{key: 'terminal', label: 'Terminal'},
+	{key: 'git', label: 'Git'},
 ];
 
 function truncate(text: string, width: number): string {
