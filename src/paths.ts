@@ -22,6 +22,10 @@ export function getStatePath(): string {
 	return path.join(getConfigDir(), 'ink-state.json');
 }
 
+export function getConfigPath(): string {
+	return path.join(getConfigDir(), 'config.json');
+}
+
 export function getProjectRoot(): string {
 	const thisFile = fileURLToPath(import.meta.url);
 	return path.resolve(path.dirname(thisFile), '..');

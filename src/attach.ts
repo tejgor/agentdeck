@@ -16,7 +16,7 @@ function clearTerminalScreen(): void {
 }
 
 function attachTargetLabel(target: AttachTarget): string {
-	return target === 'terminal' ? 'Terminal' : target === 'git' ? 'Git' : 'Agent';
+	return target === 'terminal' ? 'Terminal' : target === 'git' ? 'Git' : target === 'dev' ? 'Dev' : 'Agent';
 }
 
 function targetRequestNames(target: AttachTarget) {
@@ -38,6 +38,16 @@ function targetRequestNames(target: AttachTarget) {
 			detach: 'git-detach',
 			output: 'git-output',
 			detached: 'git-detached',
+		} as const;
+	}
+	if (target === 'dev') {
+		return {
+			attach: 'attach-dev',
+			input: 'dev-input',
+			resize: 'dev-resize',
+			detach: 'dev-detach',
+			output: 'dev-output',
+			detached: 'dev-detached',
 		} as const;
 	}
 	return {

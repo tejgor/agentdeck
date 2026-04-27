@@ -1,10 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {getConfigDir, getStatePath} from './paths.js';
+import {getConfigDir, getConfigPath, getStatePath} from './paths.js';
 import type {SessionRecord} from './types.js';
 
 interface InkState {
 	sessions: SessionRecord[];
+}
+
+interface AppConfig {
+	dev_command?: string;
 }
 
 const EMPTY_STATE: InkState = {sessions: []};
@@ -76,6 +80,21 @@ export function sortSessionsNewestFirst(sessions: SessionRecord[]): SessionRecor
 		}
 		return b.createdAt.localeCompare(a.createdAt);
 	});
+}
+
+export async function loadAppConfig(): Promise<AppConfig> {
+	await ensureConfigDir();
+	try {
+		const raw = await fs.readFile(getConfigPath(), 'utf8');
+		const parsed = JSON.parse(raw) as Partial<AppConfig>;
+		return {dev_command: typeof parsed.dev_command === 'string' ? parsed.dev_command : undefined};
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === 'ENOENT') {
+			return {};
+		}
+		throw error;
+	}
 }
 
 export function stateFileDisplayPath(): string {

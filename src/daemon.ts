@@ -8,9 +8,9 @@ import pty, {type IPty} from 'node-pty';
 import {getDaemonLogPath, getDaemonPidPath, getSocketPath} from './paths.js';
 import {createWorktreeForSession, findRepoRoot, listWorktrees, removeWorktree} from './git.js';
 import {ensureNodePtyReady} from './nodePty.js';
-import {ensureConfigDir, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
+import {ensureConfigDir, loadAppConfig, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {AgentActivityStatus, ClientRequest, CreateSessionInput, GitRecord, PreviewRecord, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
+import type {AgentActivityStatus, ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
@@ -22,7 +22,7 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 10;
+const PROTOCOL_VERSION = 11;
 
 interface RuntimeSession {
 	term: IPty;
@@ -55,12 +55,15 @@ interface ClientSubscription {
 	watchedPreviewSessionId?: string;
 	watchedTerminalSessionId?: string;
 	watchedGitSessionId?: string;
+	watchedDevSessionId?: string;
 	previewCols: number;
 	previewRows: number;
 	terminalCols: number;
 	terminalRows: number;
 	gitCols: number;
 	gitRows: number;
+	devCols: number;
+	devRows: number;
 }
 
 function sendMessage(socket: net.Socket, message: ServerMessage): void {
@@ -127,6 +130,7 @@ export class InkDaemon {
 	private readonly runtime = new Map<string, RuntimeSession>();
 	private readonly terminals = new Map<string, RuntimeTerminal>();
 	private readonly gits = new Map<string, RuntimeTerminal>();
+	private readonly devs = new Map<string, RuntimeTerminal & {command: string}>();
 	private readonly clients = new Map<net.Socket, ClientSubscription>();
 	private server?: net.Server;
 	private shuttingDown = false;
@@ -311,6 +315,18 @@ export class InkDaemon {
 			git.preview.dispose();
 		}
 		this.gits.clear();
+		for (const dev of this.devs.values()) {
+			if (dev.broadcastTimer) {
+				clearTimeout(dev.broadcastTimer);
+			}
+			try {
+				dev.term.kill();
+			} catch {
+				// ignore shutdown errors
+			}
+			dev.preview.dispose();
+		}
+		this.devs.clear();
 		await this.persist();
 
 		if (this.server) {
@@ -334,6 +350,8 @@ export class InkDaemon {
 			terminalRows: DEFAULT_PREVIEW_ROWS,
 			gitCols: DEFAULT_PREVIEW_COLS,
 			gitRows: DEFAULT_PREVIEW_ROWS,
+			devCols: DEFAULT_PREVIEW_COLS,
+			devRows: DEFAULT_PREVIEW_ROWS,
 		});
 
 		let buffer = '';
@@ -352,6 +370,10 @@ export class InkDaemon {
 				const git = this.gits.get(attachedSessionId);
 				if (git?.attachedSocket === socket) {
 					git.attachedSocket = undefined;
+				}
+				const dev = this.devs.get(attachedSessionId);
+				if (dev?.attachedSocket === socket) {
+					dev.attachedSocket = undefined;
 				}
 				attachedSessionId = undefined;
 			}
@@ -392,6 +414,8 @@ export class InkDaemon {
 				terminalRows: DEFAULT_PREVIEW_ROWS,
 				gitCols: DEFAULT_PREVIEW_COLS,
 				gitRows: DEFAULT_PREVIEW_ROWS,
+				devCols: DEFAULT_PREVIEW_COLS,
+				devRows: DEFAULT_PREVIEW_ROWS,
 			};
 			this.clients.set(socket, created);
 			return created;
@@ -449,6 +473,25 @@ export class InkDaemon {
 					sendMessage(socket, response(message.requestId, git));
 					return;
 				}
+				case 'watch-dev': {
+					const client = this.getClient(socket);
+					client.watchedDevSessionId = message.sessionId;
+					client.devCols = clampSize(message.cols, client.devCols);
+					client.devRows = clampSize(message.rows, client.devRows);
+					const dev = await this.getDevRecord(message.sessionId, client.devCols, client.devRows);
+					sendMessage(socket, response(message.requestId, dev));
+					return;
+				}
+				case 'start-dev': {
+					const dev = await this.startDev(message.sessionId, clampSize(message.cols, DEFAULT_PREVIEW_COLS), clampSize(message.rows, DEFAULT_PREVIEW_ROWS));
+					sendMessage(socket, response(message.requestId, this.buildDevRecord(message.sessionId, dev)));
+					return;
+				}
+				case 'stop-dev':
+					this.cleanupDev(message.sessionId);
+					await this.broadcastDev(message.sessionId);
+					sendMessage(socket, response(message.requestId, {ok: true}));
+					return;
 				case 'create': {
 					const session = await this.createSession(message.input);
 					sendMessage(socket, response(message.requestId, session));
@@ -601,6 +644,51 @@ export class InkDaemon {
 					}
 					setAttachedSessionId(undefined);
 					sendMessage(socket, {type: 'git-detached', sessionId: message.sessionId});
+					return;
+				}
+				case 'attach-dev': {
+					const dev = this.devs.get(message.sessionId);
+					if (!dev || dev.exited) {
+						throw new Error('no running dev command; press d to start it');
+					}
+					if (dev.attachedSocket && dev.attachedSocket !== socket && !dev.attachedSocket.destroyed) {
+						throw new Error('dev command is already attached elsewhere');
+					}
+					dev.term.resize(clampSize(message.cols ?? DEFAULT_PREVIEW_COLS, DEFAULT_PREVIEW_COLS), clampSize(message.rows ?? DEFAULT_PREVIEW_ROWS, DEFAULT_PREVIEW_ROWS));
+					dev.attachedSocket = socket;
+					setAttachedSessionId(message.sessionId);
+					sendMessage(socket, response(message.requestId, this.sessions.get(message.sessionId)));
+					sendMessage(socket, {type: 'dev-attached', sessionId: message.sessionId});
+					if (dev.scrollback) {
+						sendMessage(socket, {type: 'dev-output', sessionId: message.sessionId, data: dev.scrollback});
+					}
+					return;
+				}
+				case 'dev-input': {
+					const dev = this.devs.get(message.sessionId);
+					if (dev && !dev.exited) {
+						dev.term.write(message.data);
+					}
+					return;
+				}
+				case 'dev-resize': {
+					const dev = this.devs.get(message.sessionId);
+					if (dev && !dev.exited) {
+						const cols = Math.max(1, message.cols);
+						const rows = Math.max(1, message.rows);
+						dev.term.resize(cols, rows);
+						await dev.preview.resize(cols, rows);
+						this.scheduleDevBroadcast(message.sessionId);
+					}
+					return;
+				}
+				case 'dev-detach': {
+					const dev = this.devs.get(message.sessionId);
+					if (dev?.attachedSocket === socket) {
+						dev.attachedSocket = undefined;
+					}
+					setAttachedSessionId(undefined);
+					sendMessage(socket, {type: 'dev-detached', sessionId: message.sessionId});
 					return;
 				}
 			}
@@ -1037,6 +1125,116 @@ export class InkDaemon {
 		return this.buildGitRecord(sessionId, git);
 	}
 
+	private buildDevRecord(sessionId: string | undefined, dev?: RuntimeTerminal & {command: string}): DevRecord {
+		return {
+			sessionId,
+			content: dev?.preview.getCachedSnapshot() ?? '',
+			live: Boolean(dev && !dev.exited),
+			cwd: dev?.cwd,
+			command: dev?.command,
+			exitCode: dev?.exitCode,
+			exitSignal: dev?.exitSignal,
+		};
+	}
+
+	private scheduleDevBroadcast(sessionId: string): void {
+		const dev = this.devs.get(sessionId);
+		if (!dev || dev.broadcastTimer) return;
+		dev.broadcastTimer = setTimeout(() => {
+			dev.broadcastTimer = undefined;
+			void this.broadcastDev(sessionId);
+		}, PREVIEW_BROADCAST_DELAY_MS);
+	}
+
+	private async broadcastDev(sessionId: string): Promise<void> {
+		const dev = this.devs.get(sessionId);
+		if (dev) await dev.preview.getSnapshot();
+		for (const [socket, client] of this.clients.entries()) {
+			if (client.watchedDevSessionId !== sessionId) continue;
+			sendMessage(socket, {type: 'dev-updated', dev: this.buildDevRecord(sessionId, dev)});
+		}
+	}
+
+	private async startDev(sessionId: string, cols: number, rows: number): Promise<RuntimeTerminal & {command: string}> {
+		const session = this.sessions.get(sessionId);
+		if (!session) throw new Error('session does not exist');
+		if (session.status === 'exited') throw new Error('cannot start dev command for exited session');
+
+		const existing = this.devs.get(sessionId);
+		if (existing) {
+			if (existing.exited) this.cleanupDev(sessionId);
+			else {
+				existing.term.resize(Math.max(1, cols), Math.max(1, rows));
+				await existing.preview.resize(cols, rows);
+				return existing;
+			}
+		}
+
+		const config = await loadAppConfig();
+		const command = config.dev_command?.trim() || 'dev';
+		const shell = resolveShellCommand();
+		const term = pty.spawn(shell, ['-ic', command], {
+			name: 'xterm-256color',
+			cwd: session.cwd,
+			env: {...process.env},
+			cols: Math.max(1, cols),
+			rows: Math.max(1, rows),
+		});
+		const dev: RuntimeTerminal & {command: string} = {
+			term,
+			scrollback: '',
+			preview: new TerminalPreview(cols, rows),
+			cwd: session.cwd,
+			exited: false,
+			command,
+		};
+		this.devs.set(sessionId, dev);
+
+		term.onData(output => {
+			dev.scrollback = clampScrollback(dev.scrollback + output);
+			void dev.preview.write(output);
+			this.scheduleDevBroadcast(sessionId);
+			if (dev.attachedSocket && !dev.attachedSocket.destroyed) {
+				sendMessage(dev.attachedSocket, {type: 'dev-output', sessionId, data: output});
+			}
+		});
+
+		term.onExit(({exitCode, signal}) => {
+			dev.exited = true;
+			dev.exitCode = exitCode ?? null;
+			dev.exitSignal = signal ?? null;
+			void this.broadcastDev(sessionId);
+		});
+
+		this.scheduleDevBroadcast(sessionId);
+		return dev;
+	}
+
+	private cleanupDev(sessionId: string): void {
+		const dev = this.devs.get(sessionId);
+		if (!dev) return;
+		this.devs.delete(sessionId);
+		if (dev.broadcastTimer) clearTimeout(dev.broadcastTimer);
+		try {
+			dev.term.kill();
+		} catch {
+			// ignore cleanup errors
+		}
+		dev.preview.dispose();
+	}
+
+	private async getDevRecord(sessionId: string | undefined, cols: number, rows: number): Promise<DevRecord> {
+		if (!sessionId) return {content: '', live: false};
+		const session = this.sessions.get(sessionId);
+		if (!session) return {sessionId, content: '', live: false};
+		if (session.status === 'exited') return {sessionId, content: '', live: false, cwd: session.cwd};
+		const dev = this.devs.get(sessionId);
+		if (!dev) return {sessionId, content: '', live: false, cwd: session.cwd};
+		await dev.preview.resize(cols, rows);
+		await dev.preview.getSnapshot();
+		return this.buildDevRecord(sessionId, dev);
+	}
+
 	private async createSession(input: CreateSessionInput): Promise<SessionRecord> {
 		const title = input.title.trim();
 		if (!title) {
@@ -1295,6 +1493,7 @@ export class InkDaemon {
 		}
 		this.cleanupTerminal(sessionId);
 		this.cleanupGit(sessionId);
+		this.cleanupDev(sessionId);
 		runtime.term.kill();
 	}
 
@@ -1308,6 +1507,7 @@ export class InkDaemon {
 		}
 		this.cleanupTerminal(sessionId);
 		this.cleanupGit(sessionId);
+		this.cleanupDev(sessionId);
 		this.sessions.delete(sessionId);
 		await this.persist();
 		this.broadcastSessionRemoved(sessionId, existing.repoRoot);
@@ -1322,6 +1522,7 @@ export class InkDaemon {
 		this.runtime.delete(sessionId);
 		this.cleanupTerminal(sessionId);
 		this.cleanupGit(sessionId);
+		this.cleanupDev(sessionId);
 		if (runtime) {
 			this.clearRuntimeActivityTimers(runtime);
 		}

@@ -7,7 +7,7 @@ Fresh Ink-based rewrite prototype for multi-agent terminal workflow.
 - runs as a standalone app under `ink/`
 - uses a background daemon to keep sessions alive
 - creates `claude` or `pi` sessions backed by daemon-owned PTYs
-- shows a persistent split view with an instance sidebar and a live Preview pane
+- shows a persistent split view with an instance sidebar and Preview / Terminal / Git / Dev tabs
 - lets you cycle sessions with `j` / `k` and watch the preview follow selection
 - attaches/detaches from running sessions
 - freezes the last preview frame when a session exits
@@ -28,10 +28,12 @@ npm run dev
 ### Main view
 
 - `n` new session
-- `enter` attach to selected running session
+- `tab` cycle Preview / Terminal / Git / Dev tabs
+- `o` attach to selected running session's active tab
+- `d` start/stop the selected running session's dev command
 - `j` / `k` move between sessions
 - `x` kill selected running session
-- `d` or `delete` remove selected exited session
+- `delete` remove selected exited session
 - `r` refresh
 - `q` quit
 
@@ -40,6 +42,18 @@ npm run dev
 - choose `claude` or `pi`
 - enter a name
 - press `enter` to create
+
+### Dev command
+
+The Dev tab is started explicitly with `d` for the selected running session. Configure the global command in `~/.deckhand/config.json`:
+
+```json
+{
+  "dev_command": "npm run dev"
+}
+```
+
+If `dev_command` is omitted, deckhand runs `dev`.
 
 ### Attach mode
 

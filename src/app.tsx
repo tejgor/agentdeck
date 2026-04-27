@@ -1,12 +1,13 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Box, Text, useApp, useInput} from 'ink';
 import {LiveClient, createLiveClient} from './client.js';
+import {DevPane} from './devPane.js';
 import {GitPane} from './gitPane.js';
 import {PreviewPane} from './preview.js';
 import {Sidebar} from './sidebar.js';
 import {TabBar} from './tabs.js';
 import {TerminalPane} from './terminalPane.js';
-import type {GitRecord, PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
+import type {DevRecord, GitRecord, PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
 
 const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
 	{key: 'claude', label: 'Claude', glyph: '✶'},
@@ -24,6 +25,11 @@ const EMPTY_TERMINAL: TerminalRecord = {
 };
 
 const EMPTY_GIT: GitRecord = {
+	content: '',
+	live: false,
+};
+
+const EMPTY_DEV: DevRecord = {
 	content: '',
 	live: false,
 };
@@ -180,7 +186,7 @@ function KillConfirmPane({session, selectedIndex, canDelete, width}: {session?: 
 
 function HelpPane({width}: {width: number}) {
 	const rows = [
-		['tab', 'cycle Preview / Terminal / Git'],
+		['tab', 'cycle Preview / Terminal / Git / Dev'],
 		['o', 'attach active pane'],
 		['Ctrl+Space', 'return from attach'],
 		['n', 'new session'],
@@ -188,7 +194,8 @@ function HelpPane({width}: {width: number}) {
 		['h/l', 'resize sidebar'],
 		['x', 'kill running session'],
 		['s', 'restart exited session'],
-		['d/delete', 'remove exited session'],
+		['d', 'start/stop dev command'],
+		['delete', 'remove exited session'],
 		['r', 'refresh sessions'],
 		['q', 'quit'],
 		['esc/?', 'close help'],
@@ -210,7 +217,8 @@ function footerHint(mode: Mode, activeTab: RightPaneTab, session?: SessionRecord
 	if (mode === 'browse') {
 		const attach = session?.status === 'running' ? 'o attach' : undefined;
 		const lifecycle = session?.status === 'exited' ? 's restart • d delete' : session?.status === 'running' ? 'x kill' : undefined;
-		return ['tab pane', attach, 'j/k move', 'h/l resize', lifecycle, '? help', 'q quit'].filter(Boolean).join(' • ');
+		const dev = session?.status === 'running' ? 'd dev' : undefined;
+		return ['tab pane', attach, dev, 'j/k move', 'h/l resize', lifecycle, '? help', 'q quit'].filter(Boolean).join(' • ');
 	}
 	if (mode === 'pick-program') {
 		return 'enter continue • esc cancel • j/k switch';
@@ -242,6 +250,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 	const [preview, setPreview] = useState<PreviewRecord>(EMPTY_PREVIEW);
 	const [terminal, setTerminal] = useState<TerminalRecord>(EMPTY_TERMINAL);
 	const [git, setGit] = useState<GitRecord>(EMPTY_GIT);
+	const [dev, setDev] = useState<DevRecord>(EMPTY_DEV);
 	const [error, setError] = useState<string | undefined>();
 	const [busy, setBusy] = useState(false);
 	const [client, setClient] = useState<LiveClient | undefined>();
@@ -310,6 +319,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 							setPreview(EMPTY_PREVIEW);
 							setTerminal(EMPTY_TERMINAL);
 							setGit(EMPTY_GIT);
+							setDev(EMPTY_DEV);
 						}
 					},
 					onPreviewUpdated: nextPreview => {
@@ -338,6 +348,15 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 							return;
 						}
 						setGit(nextGit);
+					},
+					onDevUpdated: nextDev => {
+						if (nextDev.sessionId && nextDev.sessionId !== selectedIdRef.current) {
+							return;
+						}
+						if (!nextDev.sessionId && selectedIdRef.current) {
+							return;
+						}
+						setDev(nextDev);
 					},
 					onError: nextError => {
 						setError(nextError.message);
@@ -419,10 +438,12 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			setPreview(EMPTY_PREVIEW);
 			setTerminal(EMPTY_TERMINAL);
 			setGit(EMPTY_GIT);
+			setDev(EMPTY_DEV);
 			return;
 		}
 		setTerminal(current => (current.sessionId === selectedSession.id ? current : EMPTY_TERMINAL));
 		setGit(current => (current.sessionId === selectedSession.id ? current : EMPTY_GIT));
+		setDev(current => (current.sessionId === selectedSession.id ? current : EMPTY_DEV));
 		setPreview(current => {
 			const sameSession = current.sessionId === selectedSession.id;
 			const content =
@@ -572,6 +593,54 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		};
 	}, [activeTab, client, layout.previewCols, layout.previewRows, selectedId]);
 
+	useEffect(() => {
+		if (!client || activeTab !== 'dev') {
+			return;
+		}
+		let cancelled = false;
+		void client
+			.watchDev(selectedId, layout.previewCols, layout.previewRows)
+			.then(nextDev => {
+				if (cancelled) {
+					return;
+				}
+				if (nextDev.sessionId && nextDev.sessionId !== selectedId) {
+					return;
+				}
+				setDev(nextDev);
+			})
+			.catch(nextError => {
+				if (!cancelled) {
+					setError(nextError instanceof Error ? nextError.message : String(nextError));
+				}
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeTab, client, layout.previewCols, layout.previewRows, selectedId]);
+
+	const toggleDevSelected = useCallback(async () => {
+		if (!client || !selectedSession || selectedSession.status !== 'running') {
+			return;
+		}
+		setBusy(true);
+		setError(undefined);
+		try {
+			if (dev.sessionId === selectedSession.id && dev.live) {
+				await client.stopDev(selectedSession.id);
+				setDev({...EMPTY_DEV, sessionId: selectedSession.id, cwd: selectedSession.cwd});
+			} else {
+				const nextDev = await client.startDev(selectedSession.id, layout.previewCols, layout.previewRows);
+				setDev(nextDev);
+				setActiveTab('dev');
+			}
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client, dev.live, dev.sessionId, layout.previewCols, layout.previewRows, selectedSession]);
+
 	const submitCreate = useCallback(async (existingWorktreePath?: string) => {
 		const title = draftName.trim();
 		if (!title) {
@@ -634,6 +703,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			setPreview(EMPTY_PREVIEW);
 			setTerminal(EMPTY_TERMINAL);
 			setGit(EMPTY_GIT);
+			setDev(EMPTY_DEV);
 		} catch (nextError) {
 			setError(nextError instanceof Error ? nextError.message : String(nextError));
 		} finally {
@@ -693,7 +763,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (key.tab) {
-				setActiveTab(tab => (tab === 'preview' ? 'terminal' : tab === 'terminal' ? 'git' : 'preview'));
+				setActiveTab(tab => (tab === 'preview' ? 'terminal' : tab === 'terminal' ? 'git' : tab === 'git' ? 'dev' : 'preview'));
 				return;
 			}
 			if (key.upArrow || input === 'k') {
@@ -721,7 +791,11 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				}
 				return;
 			}
-			if ((input === 'd' || key.delete) && selectedSession?.status === 'exited') {
+			if (input === 'd' && selectedSession?.status === 'running') {
+				void toggleDevSelected();
+				return;
+			}
+			if (key.delete && selectedSession?.status === 'exited') {
 				void removeSelected();
 				return;
 			}
@@ -733,7 +807,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				exit({
 					kind: 'attach',
 					sessionId: selectedSession.id,
-					target: activeTab === 'terminal' ? 'terminal' : activeTab === 'git' ? 'git' : 'agent',
+					target: activeTab === 'terminal' ? 'terminal' : activeTab === 'git' ? 'git' : activeTab === 'dev' ? 'dev' : 'agent',
 					title: selectedSession.title,
 					cwd: selectedSession.cwd,
 				} satisfies UiExitResult);
@@ -884,8 +958,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 								width={layout.previewWidth}
 								height={layout.paneHeight}
 							/>
-						) : (
+						) : activeTab === 'git' ? (
 							<GitPane session={selectedSession} git={git} width={layout.previewWidth} height={layout.paneHeight} />
+						) : (
+							<DevPane session={selectedSession} dev={dev} width={layout.previewWidth} height={layout.paneHeight} />
 						)}
 					</Box>
 				) : mode === 'help' ? (

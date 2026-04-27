@@ -4,8 +4,8 @@ export type SessionStatus = 'starting' | 'running' | 'exited';
 export type AgentActivityStatus = 'unknown' | 'active' | 'idle';
 export type WorktreeMode = 'none' | 'new' | 'existing';
 export type SessionWorktreeMode = 'none' | 'managed' | 'attached';
-export type AttachTarget = 'agent' | 'terminal' | 'git';
-export type RightPaneTab = 'preview' | 'terminal' | 'git';
+export type AttachTarget = 'agent' | 'terminal' | 'git' | 'dev';
+export type RightPaneTab = 'preview' | 'terminal' | 'git' | 'dev';
 
 export interface SessionWorktreeRecord {
 	mode: SessionWorktreeMode;
@@ -72,6 +72,16 @@ export interface GitRecord {
 	exitSignal?: number | null;
 }
 
+export interface DevRecord {
+	sessionId?: string;
+	content: string;
+	live: boolean;
+	cwd?: string;
+	command?: string;
+	exitCode?: number | null;
+	exitSignal?: number | null;
+}
+
 export interface CreateSessionInput {
 	title: string;
 	program: ProgramKey;
@@ -91,6 +101,9 @@ export type ClientRequest =
 	| {type: 'watch-preview'; requestId: string; sessionId?: string; cols: number; rows: number}
 	| {type: 'watch-terminal'; requestId: string; sessionId?: string; cols: number; rows: number}
 	| {type: 'watch-git'; requestId: string; sessionId?: string; cols: number; rows: number}
+	| {type: 'watch-dev'; requestId: string; sessionId?: string; cols: number; rows: number}
+	| {type: 'start-dev'; requestId: string; sessionId: string; cols: number; rows: number}
+	| {type: 'stop-dev'; requestId: string; sessionId: string}
 	| {type: 'create'; requestId: string; input: CreateSessionInput}
 	| {type: 'restart'; requestId: string; sessionId: string; cols: number; rows: number}
 	| {type: 'kill'; requestId: string; sessionId: string; deleteWorktree?: boolean}
@@ -106,7 +119,11 @@ export type ClientRequest =
 	| {type: 'attach-git'; requestId: string; sessionId: string; cols?: number; rows?: number}
 	| {type: 'git-input'; sessionId: string; data: string}
 	| {type: 'git-resize'; sessionId: string; cols: number; rows: number}
-	| {type: 'git-detach'; sessionId: string};
+	| {type: 'git-detach'; sessionId: string}
+	| {type: 'attach-dev'; requestId: string; sessionId: string; cols?: number; rows?: number}
+	| {type: 'dev-input'; sessionId: string; data: string}
+	| {type: 'dev-resize'; sessionId: string; cols: number; rows: number}
+	| {type: 'dev-detach'; sessionId: string};
 
 export type ServerResponse<T = unknown> = {
 	type: 'response';
@@ -123,14 +140,18 @@ export type ServerEvent =
 	| {type: 'preview-updated'; preview: PreviewRecord}
 	| {type: 'terminal-updated'; terminal: TerminalRecord}
 	| {type: 'git-updated'; git: GitRecord}
+	| {type: 'dev-updated'; dev: DevRecord}
 	| {type: 'terminal-output'; sessionId: string; data: string}
 	| {type: 'git-output'; sessionId: string; data: string}
+	| {type: 'dev-output'; sessionId: string; data: string}
 	| {type: 'attached'; sessionId: string}
 	| {type: 'detached'; sessionId: string}
 	| {type: 'terminal-attached'; sessionId: string}
 	| {type: 'terminal-detached'; sessionId: string}
 	| {type: 'git-attached'; sessionId: string}
-	| {type: 'git-detached'; sessionId: string};
+	| {type: 'git-detached'; sessionId: string}
+	| {type: 'dev-attached'; sessionId: string}
+	| {type: 'dev-detached'; sessionId: string};
 
 export type ServerMessage = ServerResponse | ServerEvent;
 
