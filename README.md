@@ -1,26 +1,29 @@
-# deckhand
+# Deckhand
 
-Fresh Ink-based rewrite prototype for multi-agent terminal workflow.
+A standalone terminal workbench for managing local coding-agent sessions.
+
+Deckhand is inspired by the [claude-squad](https://github.com/smtg-ai/claude-squad) project.
 
 ## What it does today
 
-- runs as a standalone app under `ink/`
+- runs as a standalone terminal app
 - uses a background daemon to keep sessions alive
 - creates `claude` or `pi` sessions backed by daemon-owned PTYs
 - shows a persistent split view with an instance sidebar and Preview / Terminal / Git / Dev tabs
 - lets you cycle sessions with `j` / `k` and watch the preview follow selection
 - attaches/detaches from running sessions
 - freezes the last preview frame when a session exits
-- stores state in `~/.deckhand/ink-state.json`
-- writes daemon diagnostics to `~/.deckhand/ink-daemon.log`
-- tracks the active daemon PID in `~/.deckhand/ink-daemon.pid`
+- stores state in `~/.deckhand/state.json`
+- writes daemon diagnostics to `~/.deckhand/daemon.log`
+- tracks the active daemon PID in `~/.deckhand/daemon.pid`
 
 ## Run
 
 ```bash
-cd ink
 npm install
-npm run dev
+npm run build
+npm link
+deckhand
 ```
 
 ## Controls
@@ -58,10 +61,11 @@ If `dev_command` is omitted, deckhand runs `dev`.
 ### Attach mode
 
 - interact directly with the agent session
-- `Ctrl+Space` detaches and returns to Ink
+- `Ctrl+Space` detaches and returns to Deckhand
 
 ## Notes
 
+- Deckhand was inspired by the multi-agent terminal workflow workflow, but is a standalone TypeScript/Ink implementation.
 - Deckhand is inspired by `claude-squad` and implemented as an independent TypeScript/Ink application.
 - The daemon uses `node-pty` directly for long-lived PTY sessions.
 - Live Preview is powered by a daemon-side `@xterm/headless` terminal model so cursor rewrites and in-place updates render as terminal screen state instead of raw scrollback.
