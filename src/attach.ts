@@ -70,6 +70,44 @@ function compactPath(value: string | undefined, maxLength: number): string | und
 	return `…${value.slice(-(maxLength - 1))}`;
 }
 
+function sanitizeTerminalTitle(value: string): string {
+	return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function setTerminalTitle(value: string): void {
+	if (!process.stdout.isTTY) {
+		return;
+	}
+	const title = sanitizeTerminalTitle(value);
+	process.stdout.write(`\x1b]0;${title}\x07\x1b]2;${title}\x07`);
+}
+
+function setProcessTitle(value: string): void {
+	try {
+		process.title = sanitizeTerminalTitle(value);
+	} catch {
+		// Best-effort only. Some platforms/hosts ignore process title changes.
+	}
+}
+
+function attachTargetTitleLabel(target: AttachTarget): string {
+	return target === 'terminal' ? 'term' : target === 'git' ? 'git' : target === 'dev' ? 'dev' : 'agent';
+}
+
+function compactTerminalTitle(value: string, maxLength = 32): string {
+	const title = sanitizeTerminalTitle(value);
+	if (title.length <= maxLength) {
+		return title;
+	}
+	return maxLength <= 1 ? title.slice(0, maxLength) : `${title.slice(0, maxLength - 1)}…`;
+}
+
+function attachedTerminalTitle(sessionId: string, target: AttachTarget, options: AttachSessionOptions): string {
+	const title = compactTerminalTitle(options.title ?? sessionId);
+	const label = attachTargetTitleLabel(target);
+	return `ad/${label} ${title}`;
+}
+
 function writeAttachBanner(sessionId: string, target: AttachTarget, options: AttachSessionOptions): void {
 	const title = options.title ?? sessionId;
 	const label = attachTargetLabel(target);
@@ -97,8 +135,10 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 	const socket = await openPersistentConnection();
 	const requestId = randomUUID();
 	const names = targetRequestNames(target);
+	const originalProcessTitle = process.title || 'deckhand';
 	let attached = false;
 	let cleanedUp = false;
+	let titleSet = false;
 
 	await new Promise<void>((resolve, reject) => {
 		const restoreRawMode = () => {
@@ -113,6 +153,10 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 			}
 			cleanedUp = true;
 			restoreRawMode();
+			if (titleSet) {
+				setTerminalTitle('deckhand');
+				setProcessTitle(originalProcessTitle);
+			}
 			process.stdout.off('resize', onResize);
 			process.stdin.off('data', onInput);
 			stopParsing();
@@ -158,6 +202,10 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 					return;
 				}
 				attached = true;
+				const nextTitle = attachedTerminalTitle(sessionId, target, options);
+				setTerminalTitle(nextTitle);
+				setProcessTitle(nextTitle);
+				titleSet = true;
 				if (process.stdin.isTTY) {
 					process.stdin.setRawMode?.(true);
 				}
@@ -170,6 +218,11 @@ export async function attachSession(sessionId: string, target: AttachTarget = 'a
 
 			if (message.type === names.output && message.sessionId === sessionId) {
 				process.stdout.write(message.data);
+				if (titleSet) {
+					const activeTitle = attachedTerminalTitle(sessionId, target, options);
+					setTerminalTitle(activeTitle);
+					setProcessTitle(activeTitle);
+				}
 				return;
 			}
 

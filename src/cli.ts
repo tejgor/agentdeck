@@ -7,6 +7,8 @@ import {InkDaemon} from './daemon.js';
 import {ensureGitRepo} from './git.js';
 import type {UiExitResult} from './types.js';
 
+process.title = 'deckhand';
+
 function clearTerminalScreen(): void {
 	if (process.stdout.isTTY) {
 		process.stdout.write('\x1b[2J\x1b[H');
