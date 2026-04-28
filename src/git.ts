@@ -172,7 +172,7 @@ async function runCreateScript(scriptPath: string, name: string, cwd: string, la
 			}
 			reject(new Error(`create-worktree.sh failed with exit code ${String(code)}: ${stderrBuffer.trim()}`));
 		});
-		child.stdin.end(`${JSON.stringify({name})}\n`);
+		child.stdin.end(`${JSON.stringify({name, cwd: launchCwd})}\n`);
 	});
 	const lines = stdout
 		.split('\n')
@@ -210,7 +210,7 @@ async function fallbackCreateWorktree(name: string, currentWorktreeRoot: string,
 	if (branchExists) {
 		await execFileAsync('git', ['-C', currentWorktreeRoot, 'worktree', 'add', worktreePath, name]);
 	} else {
-		await execFileAsync('git', ['-C', currentWorktreeRoot, 'worktree', 'add', worktreePath, '-b', name, start]);
+		await execFileAsync('git', ['-C', currentWorktreeRoot, 'worktree', 'add', '-b', name, worktreePath, start]);
 	}
 	return worktreePath;
 }
