@@ -8,6 +8,7 @@ import {Sidebar} from './sidebar.js';
 import {TabBar} from './tabs.js';
 import {TerminalPane} from './terminalPane.js';
 import type {DevRecord, GitRecord, PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMode} from './types.js';
+import {THEME, compactPath, truncate} from './ui.js';
 
 const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
 	{key: 'claude', label: 'Claude', glyph: '✶'},
@@ -104,7 +105,11 @@ function upsertSession(existing: SessionRecord[], session: SessionRecord): Sessi
 }
 
 function describeConnection(client: LiveClient | undefined): string {
-	return client ? 'connected' : 'connecting…';
+	return client ? 'ready' : 'connecting…';
+}
+
+function connectionColor(client: LiveClient | undefined): string {
+	return client ? THEME.success : THEME.warn;
 }
 
 function CreatePane({
@@ -121,71 +126,101 @@ function CreatePane({
 	width: number;
 }) {
 	return (
-		<Box flexDirection="column" width={width}>
-			<Text bold>
+		<Box flexDirection="column" width={width} borderStyle="round" borderColor={THEME.borderActive} paddingX={1} paddingY={0}>
+			<Text color={THEME.accent} bold>
 				{mode === 'pick-program'
-					? 'Create session'
-					: `Create ${PROGRAMS[programIndex]!.glyph} ${PROGRAMS[programIndex]!.label} session`}
+					? 'New session'
+					: `New ${PROGRAMS[programIndex]!.label} session`}
 			</Text>
-			{mode === 'pick-program' ? (
-				<>
-					<Text>Select agent:</Text>
-					{PROGRAMS.map((program, index) => (
-						<Text key={program.key} inverse={index === programIndex}>
-							{index === programIndex ? '›' : ' '} {program.glyph} {program.label}
-						</Text>
-					))}
-					<Text dimColor>enter continue • esc cancel • arrows switch</Text>
-				</>
-			) : (
-				<>
-					<Text>Name: {draftName || '█'}</Text>
-					<Text>Worktree: {WORKTREE_MODES.find(item => item.key === worktreeMode)?.label}</Text>
-					<Text dimColor>tab cycle worktree • enter create • esc back • backspace delete</Text>
-				</>
-			)}
+			<Box marginTop={1} flexDirection="column">
+				{mode === 'pick-program' ? (
+					<>
+						<Text color={THEME.muted}>Choose an agent</Text>
+						{PROGRAMS.map((program, index) => {
+							const selected = index === programIndex;
+							return (
+								<Text key={program.key} inverse={selected} color={selected ? THEME.active : undefined} bold={selected}>
+									{selected ? '›' : ' '} {program.glyph} {program.label}
+								</Text>
+							);
+						})}
+					</>
+				) : (
+					<>
+						<Text>Name: <Text color={draftName ? THEME.active : THEME.muted}>{draftName || '█'}</Text></Text>
+						<Text>Workspace: <Text color={THEME.accent}>{WORKTREE_MODES.find(item => item.key === worktreeMode)?.label}</Text></Text>
+					</>
+				)}
+			</Box>
+			<Box marginTop={1}>
+				<Text color={THEME.muted}>
+					{mode === 'pick-program' ? 'enter continue · esc cancel · ↑↓ switch' : 'tab worktree · enter create · esc back'}
+				</Text>
+			</Box>
 		</Box>
 	);
 }
 
-function worktreeLabel(worktree: WorktreeInfoRecord): string {
+function worktreeLabel(worktree: WorktreeInfoRecord, width: number): string {
 	const branch = worktree.branch || '(detached)';
-	return `${worktree.isMain ? 'main ' : ''}${branch}  ${worktree.path}`;
+	const prefix = worktree.isMain ? 'main · ' : '';
+	const pathBudget = Math.max(8, width - prefix.length - branch.length - 2);
+	return truncate(`${prefix}${branch}  ${compactPath(worktree.path, pathBudget)}`, width);
 }
 
 function WorktreePickerPane({worktrees, selectedIndex, width}: {worktrees: WorktreeInfoRecord[]; selectedIndex: number; width: number}) {
+	const contentWidth = Math.max(1, width - 4);
 	return (
-		<Box flexDirection="column" width={width}>
-			<Text bold>Select existing worktree</Text>
-			{worktrees.length === 0 ? <Text dimColor>No worktrees found.</Text> : null}
-			{worktrees.map((worktree, index) => (
-				<Text key={worktree.path} inverse={index === selectedIndex}>
-					{index === selectedIndex ? '›' : ' '} {worktreeLabel(worktree)}
-				</Text>
-			))}
-			<Text dimColor>enter select • esc back • j/k move</Text>
+		<Box flexDirection="column" width={width} borderStyle="round" borderColor={THEME.borderActive} paddingX={1}>
+			<Text color={THEME.accent} bold>Existing worktree</Text>
+			<Box marginTop={1} flexDirection="column">
+				{worktrees.length === 0 ? <Text color={THEME.muted}>No worktrees found.</Text> : null}
+				{worktrees.map((worktree, index) => {
+					const selected = index === selectedIndex;
+					return (
+						<Text key={worktree.path} inverse={selected} color={selected ? THEME.active : undefined}>
+							{selected ? '›' : ' '} {worktreeLabel(worktree, contentWidth - 2)}
+						</Text>
+					);
+				})}
+			</Box>
+			<Box marginTop={1}>
+				<Text color={THEME.muted}>enter select · esc back · j/k move</Text>
+			</Box>
 		</Box>
 	);
 }
 
 function KillConfirmPane({session, selectedIndex, canDelete, width}: {session?: SessionRecord; selectedIndex: number; canDelete: boolean; width: number}) {
 	const options = canDelete ? ['Kill only, keep worktree', 'Kill and delete worktree', 'Cancel'] : ['Kill session', 'Cancel'];
+	const contentWidth = Math.max(1, width - 4);
 	return (
-		<Box flexDirection="column" width={width}>
-			<Text bold>Kill session{session ? ` "${session.title}"` : ''}?</Text>
-			{session?.worktree?.path ? <Text dimColor>{session.worktree.path}</Text> : null}
-			{options.map((option, index) => (
-				<Text key={option} inverse={index === selectedIndex}>
-					{index === selectedIndex ? '›' : ' '} {option}
-				</Text>
-			))}
-			<Text dimColor>enter choose • esc cancel • j/k move</Text>
+		<Box flexDirection="column" width={width} borderStyle="round" borderColor={THEME.borderDanger} paddingX={1}>
+			<Text color={THEME.error} bold>Kill {session ? `"${session.title}"` : 'session'}?</Text>
+			{session?.worktree?.path ? (
+				<Text color={THEME.muted}>{truncate(compactPath(session.worktree.path, contentWidth), contentWidth)}</Text>
+			) : null}
+			<Box marginTop={1} flexDirection="column">
+				{options.map((option, index) => {
+					const selected = index === selectedIndex;
+					const isCancel = option === 'Cancel';
+					const color = selected ? (isCancel ? THEME.muted : THEME.error) : undefined;
+					return (
+						<Text key={option} inverse={selected} color={color} bold={selected}>
+							{selected ? '›' : ' '} {option}
+						</Text>
+					);
+				})}
+			</Box>
+			<Box marginTop={1}>
+				<Text color={THEME.muted}>enter choose · esc cancel · j/k move</Text>
+			</Box>
 		</Box>
 	);
 }
 
 function HelpPane({width}: {width: number}) {
-	const rows = [
+	const rows: Array<[string, string]> = [
 		['tab', 'cycle Preview / Terminal / Git / Dev'],
 		['o', 'attach active pane'],
 		['Ctrl+Space', 'return from attach'],
@@ -201,14 +236,16 @@ function HelpPane({width}: {width: number}) {
 		['esc/?', 'close help'],
 	];
 	return (
-		<Box flexDirection="column" width={width}>
-			<Text bold>Keyboard shortcuts</Text>
-			<Text dimColor>Browse mode</Text>
-			{rows.map(([key, description]) => (
-				<Text key={key}>
-					<Text color="cyan">{key.padEnd(12)}</Text> {description}
-				</Text>
-			))}
+		<Box flexDirection="column" width={width} borderStyle="round" borderColor={THEME.borderActive} paddingX={1}>
+			<Text color={THEME.accent} bold>Keyboard shortcuts</Text>
+			<Box marginTop={1} flexDirection="column">
+				{rows.map(([key, description]) => (
+					<Text key={key}>
+						<Text color={THEME.active} bold>{key.padEnd(12)}</Text>
+						<Text color={THEME.muted}>{description}</Text>
+					</Text>
+				))}
+			</Box>
 		</Box>
 	);
 }
@@ -468,18 +505,22 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 		const totalWidth = terminalSize.cols;
 		const totalHeight = terminalSize.rows;
 		const leftWidth = clampSidebarWidth(sidebarWidthOverride ?? sidebarWidth(totalWidth), totalWidth);
-		const separatorWidth = 3;
+		const separatorWidth = 1;
 		const rightWidth = Math.max(20, totalWidth - leftWidth - separatorWidth);
 		const footerLines = error ? 3 : 2;
 		const contentHeight = Math.max(8, totalHeight - 2 - footerLines);
-		const paneHeight = Math.max(1, contentHeight - 1);
-		const previewRows = Math.max(1, paneHeight - 2);
+		// Right pane wrapper consumes 4 cols (border 2 + paddingX 2) and 4 rows
+		// (border 2 + tabbar 1 + spacer 1) before the sub-pane content begins.
+		const paneInnerWidth = Math.max(10, rightWidth - 4);
+		const paneInnerHeight = Math.max(4, contentHeight - 4);
+		const previewRows = Math.max(1, paneInnerHeight - 2);
 		return {
 			sidebarWidth: leftWidth,
 			previewWidth: rightWidth,
 			contentHeight,
-			paneHeight,
-			previewCols: rightWidth,
+			paneInnerWidth,
+			paneInnerHeight,
+			previewCols: paneInnerWidth,
 			previewRows,
 		};
 	}, [error, sidebarWidthOverride, terminalSize.cols, terminalSize.rows]);
@@ -927,10 +968,14 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 
 	return (
 		<Box flexDirection="column">
-			<Text color="cyan">deckhand</Text>
-			<Text dimColor>
-				repo: {repoRoot} • {describeConnection(client)}
-			</Text>
+			<Box justifyContent="space-between" width={terminalSize.cols}>
+				<Text color={THEME.accent} bold>deckhand</Text>
+				<Text color={connectionColor(client)}>● {describeConnection(client)}</Text>
+			</Box>
+			<Box justifyContent="space-between" width={terminalSize.cols}>
+				<Text color={THEME.muted}>{truncate(compactPath(repoRoot, Math.max(10, terminalSize.cols - 16)), Math.max(10, terminalSize.cols - 16))}</Text>
+				<Text color={THEME.muted}>{sessions.length} session{sessions.length === 1 ? '' : 's'}</Text>
+			</Box>
 			<Box flexDirection="row">
 				<Sidebar
 					sessions={sessions}
@@ -939,29 +984,37 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 					height={layout.contentHeight}
 					spinnerFrame={spinnerFrame}
 				/>
-				<Text dimColor> │ </Text>
+				<Box width={1} />
 				{mode === 'browse' ? (
-					<Box flexDirection="column" width={layout.previewWidth} height={layout.contentHeight}>
-						<TabBar activeTab={activeTab} width={layout.previewWidth} />
+					<Box
+						flexDirection="column"
+						width={layout.previewWidth}
+						height={layout.contentHeight}
+						borderStyle="round"
+						borderColor={THEME.border}
+						paddingX={1}
+					>
+						<TabBar activeTab={activeTab} width={layout.paneInnerWidth} />
+						<Box height={1} />
 						{activeTab === 'preview' ? (
 							<PreviewPane
 								session={selectedSession}
 								preview={preview}
-								width={layout.previewWidth}
-								height={layout.paneHeight}
+								width={layout.paneInnerWidth}
+								height={layout.paneInnerHeight}
 								spinnerFrame={spinnerFrame}
 							/>
 						) : activeTab === 'terminal' ? (
 							<TerminalPane
 								session={selectedSession}
 								terminal={terminal}
-								width={layout.previewWidth}
-								height={layout.paneHeight}
+								width={layout.paneInnerWidth}
+								height={layout.paneInnerHeight}
 							/>
 						) : activeTab === 'git' ? (
-							<GitPane session={selectedSession} git={git} width={layout.previewWidth} height={layout.paneHeight} />
+							<GitPane session={selectedSession} git={git} width={layout.paneInnerWidth} height={layout.paneInnerHeight} />
 						) : (
-							<DevPane session={selectedSession} dev={dev} width={layout.previewWidth} height={layout.paneHeight} />
+							<DevPane session={selectedSession} dev={dev} width={layout.paneInnerWidth} height={layout.paneInnerHeight} />
 						)}
 					</Box>
 				) : mode === 'help' ? (
@@ -985,9 +1038,9 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 					/>
 				)}
 			</Box>
-			<Text dimColor>{footerHint(mode, activeTab, selectedSession)}</Text>
-			{busy ? <Text color="yellow">Working…</Text> : null}
-			{error ? <Text color="red">Error: {error}</Text> : null}
+			<Text color={THEME.muted}>{footerHint(mode, activeTab, selectedSession)}</Text>
+			{busy ? <Text color={THEME.warn}>Working…</Text> : null}
+			{error ? <Text color={THEME.error}>Error: {error}</Text> : null}
 		</Box>
 	);
 }

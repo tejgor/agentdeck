@@ -1,25 +1,13 @@
 import React from 'react';
 import {Box, Text} from 'ink';
 import type {DevRecord, SessionRecord} from './types.js';
+import {THEME, compactPath, fitLines, truncate} from './ui.js';
 
 interface DevPaneProps {
 	session?: SessionRecord;
 	dev: DevRecord;
 	width: number;
 	height: number;
-}
-
-function truncate(text: string, width: number): string {
-	if (width <= 0) return '';
-	if (text.length <= width) return text;
-	return width === 1 ? text.slice(0, 1) : `${text.slice(0, width - 1)}…`;
-}
-
-function fitLines(text: string, width: number, height: number): string[] {
-	const rawLines = text.length > 0 ? text.split('\n') : [''];
-	const lines = rawLines.map(line => truncate(line, width));
-	if (lines.length >= height) return lines.slice(0, height);
-	return [...lines, ...Array.from({length: height - lines.length}, () => '')];
 }
 
 function fallbackMessage(session: SessionRecord | undefined, dev: DevRecord): string {
@@ -31,19 +19,21 @@ function fallbackMessage(session: SessionRecord | undefined, dev: DevRecord): st
 }
 
 export function DevPane({session, dev, width, height}: DevPaneProps) {
-	const header = session ? `Dev — ${session.title}${dev.live ? ' ●' : ' ○'}` : 'Dev';
-	const command = dev.command ? ` • ${dev.command}` : '';
-	const subheader = `${dev.cwd ?? session?.cwd ?? 'Select a session from the sidebar.'}${command}`;
-	const bodyHeight = Math.max(1, height - 2);
+	const bodyHeight = Math.max(1, height - 1);
 	const lines = fitLines(fallbackMessage(session, dev), width, bodyHeight);
+	const status = dev.live ? '● live' : '○ idle';
+	const command = dev.command ? ` · ${dev.command}` : '';
+	const pathSource = dev.cwd ?? session?.worktree?.path ?? session?.cwd ?? 'Select a session from the sidebar.';
+	const cwdBudget = Math.max(8, width - status.length - 1 - command.length);
+	const cwd = compactPath(pathSource, cwdBudget);
 
 	return (
 		<Box flexDirection="column" width={width} height={height}>
-			<Text bold>{truncate(header, width)}</Text>
-			<Text dimColor>{truncate(subheader, width)}</Text>
-			{lines.map((line, index) => (
-				<Text key={`dev-line-${index}`}>{line}</Text>
-			))}
+			<Box justifyContent="space-between" width={width}>
+				<Text color={THEME.muted}>{truncate(`${cwd}${command}`, cwdBudget + command.length)}</Text>
+				<Text color={dev.live ? THEME.success : THEME.muted}>{status}</Text>
+			</Box>
+			{lines.map((line, index) => <Text key={`dev-line-${index}`}>{line}</Text>)}
 		</Box>
 	);
 }
