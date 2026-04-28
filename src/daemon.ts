@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import {constants as fsConstants} from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import {execFile} from 'node:child_process';
@@ -85,15 +86,36 @@ function failure(requestId: string, error: unknown): ServerResponse {
 	};
 }
 
+const programCommandCache = new Map<SessionRecord['program'], string>();
+
 async function resolveProgramCommand(program: SessionRecord['program']): Promise<string> {
-	const shell = process.env.SHELL || '/bin/bash';
-	try {
-		const {stdout} = await execFileAsync(shell, ['-ic', `command -v ${program}`]);
-		const resolved = stdout.trim();
-		return resolved || program;
-	} catch {
+	const cached = programCommandCache.get(program);
+	if (cached) {
+		return cached;
+	}
+
+	if (program.includes('/')) {
+		programCommandCache.set(program, program);
 		return program;
 	}
+
+	const pathValue = process.env.PATH || '';
+	for (const directory of pathValue.split(path.delimiter)) {
+		if (!directory) {
+			continue;
+		}
+		const candidate = path.join(directory, program);
+		try {
+			await fs.access(candidate, fsConstants.X_OK);
+			programCommandCache.set(program, candidate);
+			return candidate;
+		} catch {
+			// Try the next PATH entry.
+		}
+	}
+
+	programCommandCache.set(program, program);
+	return program;
 }
 
 function resolveShellCommand(): string {
@@ -1251,6 +1273,39 @@ export class InkDaemon {
 		}
 
 		const command = await resolveProgramCommand(input.program);
+		const now = new Date().toISOString();
+		const baseSession: SessionRecord = {
+			id: randomUUID(),
+			title,
+			program: input.program,
+			command,
+			cwd: input.cwd,
+			repoRoot: input.repoRoot,
+			launchCwd: input.cwd,
+			launchWorktreeRoot: input.cwd,
+			worktree: {mode: 'none'},
+			status: 'starting',
+			agentStatus: 'unknown',
+			agentStatusUpdatedAt: now,
+			createdAt: now,
+			updatedAt: now,
+			lastPreview: '',
+		};
+
+		this.sessions.set(baseSession.id, baseSession);
+		this.broadcastSessionUpdated(baseSession);
+		void this.persist().catch(error => console.error('failed to persist starting session', error));
+		void this.finishCreateSession(baseSession.id, input).catch(error => this.failStartingSession(baseSession.id, error));
+		return baseSession;
+	}
+
+	private async finishCreateSession(sessionId: string, input: CreateSessionInput): Promise<void> {
+		const startingSession = this.sessions.get(sessionId);
+		if (!startingSession || startingSession.status !== 'starting') {
+			return;
+		}
+
+		const title = startingSession.title;
 		const launchCwd = input.cwd;
 		const launchWorktreeRoot = await findRepoRoot(launchCwd);
 		let sessionCwd = launchCwd;
@@ -1291,51 +1346,32 @@ export class InkDaemon {
 				name: selected.branch || selected.path.split('/').at(-1),
 			};
 		}
-		const now = new Date().toISOString();
-		const baseSession: SessionRecord = {
-			id: randomUUID(),
-			title,
-			program: input.program,
-			command,
+
+		const preparedSession: SessionRecord = {
+			...startingSession,
 			cwd: sessionCwd,
-			repoRoot: input.repoRoot,
-			launchCwd,
 			launchWorktreeRoot,
 			worktree,
-			status: 'starting',
-			agentStatus: 'unknown',
-			agentStatusUpdatedAt: now,
-			createdAt: now,
-			updatedAt: now,
-			lastPreview: '',
+			updatedAt: new Date().toISOString(),
 		};
-		this.sessions.set(baseSession.id, baseSession);
-		await this.persist();
-		this.broadcastSessionUpdated(baseSession);
+		this.sessions.set(sessionId, preparedSession);
+		this.broadcastSessionUpdated(preparedSession);
 
-		let term: IPty;
-		try {
-			term = pty.spawn(command, [], {
-				name: 'xterm-256color',
-				cwd: sessionCwd,
-				env: {...process.env},
-				cols: Math.max(1, input.cols),
-				rows: Math.max(1, input.rows),
-			});
-		} catch (error) {
-			this.sessions.delete(baseSession.id);
-			await this.persist();
-			this.broadcastSessionRemoved(baseSession.id, baseSession.repoRoot);
-			throw error;
-		}
+		const term = pty.spawn(preparedSession.command, [], {
+			name: 'xterm-256color',
+			cwd: sessionCwd,
+			env: {...process.env},
+			cols: Math.max(1, input.cols),
+			rows: Math.max(1, input.rows),
+		});
 
 		const runningSession: SessionRecord = {
-			...baseSession,
+			...preparedSession,
 			status: 'running',
 			updatedAt: new Date().toISOString(),
 			pid: term.pid,
 		};
-		this.sessions.set(baseSession.id, runningSession);
+		this.sessions.set(sessionId, runningSession);
 
 		const runtime: RuntimeSession = {
 			term,
@@ -1344,30 +1380,48 @@ export class InkDaemon {
 			lastPreviewSnapshot: '',
 			previewChangeEvents: [],
 		};
-		this.runtime.set(baseSession.id, runtime);
+		this.runtime.set(sessionId, runtime);
 		runtime.activityIdleTimer = setTimeout(() => {
 			runtime.activityIdleTimer = undefined;
-			void this.setAgentStatus(baseSession.id, 'idle');
+			void this.setAgentStatus(sessionId, 'idle');
 		}, IDLE_AFTER_MS);
 
 		term.onData(output => {
 			runtime.scrollback = clampScrollback(runtime.scrollback + output);
 			void runtime.preview.write(output);
-			this.scheduleActivityEvaluation(baseSession.id);
-			this.schedulePreviewBroadcast(baseSession.id);
+			this.scheduleActivityEvaluation(sessionId);
+			this.schedulePreviewBroadcast(sessionId);
 			if (runtime.attachedSocket && !runtime.attachedSocket.destroyed) {
-				sendMessage(runtime.attachedSocket, {type: 'output', sessionId: baseSession.id, data: output});
+				sendMessage(runtime.attachedSocket, {type: 'output', sessionId, data: output});
 			}
 		});
 
 		term.onExit(({exitCode, signal}) => {
-			void this.handleSessionExit(baseSession.id, exitCode ?? null, signal ?? null);
+			void this.handleSessionExit(sessionId, exitCode ?? null, signal ?? null);
 		});
 
 		await this.persist();
 		this.broadcastSessionUpdated(runningSession);
 		this.schedulePreviewBroadcast(runningSession.id);
-		return runningSession;
+	}
+
+	private async failStartingSession(sessionId: string, error: unknown): Promise<void> {
+		const session = this.sessions.get(sessionId);
+		if (!session || session.status !== 'starting') {
+			return;
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		const failedSession: SessionRecord = {
+			...session,
+			status: 'exited',
+			updatedAt: new Date().toISOString(),
+			exitCode: null,
+			exitSignal: null,
+			lastPreview: `Failed to start session: ${message}`,
+		};
+		this.sessions.set(sessionId, failedSession);
+		await this.persist();
+		this.broadcastSessionUpdated(failedSession);
 	}
 
 	private async restartSession(sessionId: string, cols: number, rows: number): Promise<SessionRecord> {
