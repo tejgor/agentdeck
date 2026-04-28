@@ -17,14 +17,35 @@ Deckhand is inspired by the [claude-squad](https://github.com/smtg-ai/claude-squ
 - writes daemon diagnostics to `~/.deckhand/daemon.log`
 - tracks the active daemon PID in `~/.deckhand/daemon.pid`
 
-## Run
+## Install as a CLI
+
+From this checkout:
 
 ```bash
 npm install
 npm run build
 npm link
+```
+
+Then launch it from any git repo:
+
+```bash
 deckhand
 ```
+
+For a global install without a symlink, use:
+
+```bash
+npm install -g .
+```
+
+After changing source code, rebuild before using the linked CLI again:
+
+```bash
+npm run build
+```
+
+The CLI binary is declared in `package.json` as `deckhand -> dist/cli.js`, so the built `dist/cli.js` file is what gets put on your `PATH`.
 
 ## Controls
 
@@ -65,7 +86,7 @@ If `dev_command` is omitted, deckhand runs `dev`.
 
 ## Notes
 
-- Deckhand was inspired by the multi-agent terminal workflow workflow, but is a standalone TypeScript/Ink implementation.
+- Deckhand is a standalone TypeScript/Ink implementation for managing local coding-agent sessions.
 - Deckhand is inspired by `claude-squad` and implemented as an independent TypeScript/Ink application.
 - The daemon uses `node-pty` directly for long-lived PTY sessions.
 - Live Preview is powered by a daemon-side `@xterm/headless` terminal model so cursor rewrites and in-place updates render as terminal screen state instead of raw scrollback.
