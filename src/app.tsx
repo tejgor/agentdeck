@@ -230,7 +230,7 @@ function HelpPane({width}: {width: number}) {
 		['x', 'kill running session'],
 		['s', 'restart exited session'],
 		['d', 'start/stop dev command'],
-		['delete', 'remove exited session'],
+		['backspace', 'remove exited session'],
 		['r', 'refresh sessions'],
 		['q', 'quit'],
 		['esc/?', 'close help'],
@@ -253,7 +253,7 @@ function HelpPane({width}: {width: number}) {
 function footerHint(mode: Mode, activeTab: RightPaneTab, session?: SessionRecord): string {
 	if (mode === 'browse') {
 		const attach = session?.status === 'running' ? 'o attach' : undefined;
-		const lifecycle = session?.status === 'exited' ? 's restart • d delete' : session?.status === 'running' ? 'x kill' : undefined;
+		const lifecycle = session?.status === 'exited' ? 's restart • backspace remove' : session?.status === 'running' ? 'x kill' : undefined;
 		const dev = session?.status === 'running' ? 'd dev' : undefined;
 		return ['tab pane', attach, dev, 'j/k move', 'h/l resize', lifecycle, '? help', 'q quit'].filter(Boolean).join(' • ');
 	}
@@ -836,7 +836,7 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				void toggleDevSelected();
 				return;
 			}
-			if (key.delete && selectedSession?.status === 'exited') {
+			if ((key.backspace || key.delete) && selectedSession?.status === 'exited') {
 				void removeSelected();
 				return;
 			}
@@ -845,6 +845,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				return;
 			}
 			if (input === 'o' && selectedSession?.status === 'running') {
+				if (activeTab === 'dev' && !(dev.sessionId === selectedSession.id && dev.live)) {
+					setError('start the dev command with d before attaching');
+					return;
+				}
 				exit({
 					kind: 'attach',
 					sessionId: selectedSession.id,

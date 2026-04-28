@@ -54,7 +54,13 @@ async function main(): Promise<void> {
 		}
 		if (result.kind === 'attach') {
 			clearTerminalScreen();
-			await attachSession(result.sessionId, result.target, {title: result.title, cwd: result.cwd});
+			try {
+				await attachSession(result.sessionId, result.target, {title: result.title, cwd: result.cwd});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				process.stderr.write(`\nattach failed: ${message}\n`);
+				await new Promise(resolve => setTimeout(resolve, 1500));
+			}
 			clearTerminalScreen();
 		}
 	}
