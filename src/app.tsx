@@ -42,6 +42,18 @@ const WORKTREE_MODES: Array<{key: WorktreeMode; label: string}> = [
 	{key: 'existing', label: 'existing worktree'},
 ];
 
+const ANSI_ESCAPE_PATTERN = /\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F-\u009F]/g;
+const ORPHAN_TERMINAL_SEQUENCE_PATTERN = /^(?:\[(?:[ABCDHFIOZ]|\d+(?:;\d+)*[~ABCDHF])|O[ABCDHF])$/;
+
+function sanitizeNameInput(input: string): string {
+	const cleaned = input
+		.replace(ANSI_ESCAPE_PATTERN, '')
+		.replace(CONTROL_CHARACTER_PATTERN, '');
+
+	return ORPHAN_TERMINAL_SEQUENCE_PATTERN.test(cleaned) ? '' : cleaned;
+}
+
 type Mode = 'browse' | 'pick-program' | 'enter-name' | 'pick-worktree' | 'confirm-kill' | 'help';
 
 interface AppProps {
@@ -886,6 +898,10 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 			}
 			if (key.return) {
 				if (worktreeMode === 'existing') {
+					if (!draftName.trim()) {
+						setError('title cannot be empty');
+						return;
+					}
 					if (!client) {
 						setError('still connecting to daemon');
 						return;
@@ -916,8 +932,14 @@ export function App({repoRoot, cwd, initialSidebarWidth, onSidebarWidthChange}: 
 				});
 				return;
 			}
+			if (key.ctrl || key.meta || key.upArrow || key.downArrow || key.leftArrow || key.rightArrow) {
+				return;
+			}
 			if (input) {
-				setDraftName(value => value + input);
+				const text = sanitizeNameInput(input);
+				if (text) {
+					setDraftName(value => value + text);
+				}
 			}
 			return;
 		}
