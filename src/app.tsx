@@ -9,7 +9,7 @@ import {Sidebar} from './sidebar.js';
 import {sortSessionsForSidebar} from './sessionOrder.js';
 import {TabBar} from './tabs.js';
 import {TerminalPane} from './terminalPane.js';
-import type {DevRecord, GitRecord, PreviewRecord, ProgramKey, RightPaneTab, SessionRecord, SubSessionKind, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMergeMode, WorktreeMode} from './types.js';
+import type {DevRecord, GitRecord, PreviewRecord, ProgramKey, RemoteControlStatus, RemoteEnableResult, RemotePairingInfo, RightPaneTab, SessionRecord, SubSessionKind, TerminalRecord, UiExitResult, WorktreeInfoRecord, WorktreeMergeMode, WorktreeMode} from './types.js';
 import {THEME, compactPath, truncate} from './ui.js';
 
 const PROGRAMS: Array<{key: ProgramKey; label: string; glyph: string}> = [
@@ -106,7 +106,7 @@ function sanitizeNameInput(input: string): string {
 	return cleaned.replace(ALLOWED_NAME_INPUT_PATTERN, '');
 }
 
-type Mode = 'browse' | 'preview-focus' | 'pick-program' | 'enter-name' | 'pick-worktree' | 'confirm-kill' | 'confirm-merge' | 'help';
+type Mode = 'browse' | 'preview-focus' | 'pick-program' | 'enter-name' | 'pick-worktree' | 'confirm-kill' | 'confirm-merge' | 'remote' | 'help';
 
 interface AppProps {
 	repoRoot: string;
@@ -352,6 +352,37 @@ function KillConfirmPane({session, selectedIndex, canDelete, canDeleteBranch, fo
 	);
 }
 
+function RemotePane({status, pairing, tokenResult, width}: {status?: RemoteControlStatus; pairing?: RemotePairingInfo; tokenResult?: RemoteEnableResult; width: number}) {
+	const contentWidth = Math.max(1, width - 4);
+	return (
+		<Box flexDirection="column" width={width} borderStyle="round" borderColor={THEME.borderActive} paddingX={1}>
+			<Text color={THEME.accent} bold>Mobile remote control</Text>
+			<Box marginTop={1} flexDirection="column">
+				<Text>Status: <Text color={status?.enabled ? THEME.success : THEME.muted}>{status?.enabled ? 'enabled' : 'disabled'}</Text>{status?.enabled ? ` · ${status.listening ? 'listening' : 'not listening'}` : ''}</Text>
+				<Text>URL: <Text color={status?.enabled ? THEME.active : THEME.muted}>{status?.url || 'not configured'}</Text></Text>
+				<Text>Mode: <Text color={THEME.accent}>{status?.mode || 'admin'}</Text> · Token: {status?.tokenConfigured ? 'configured' : 'missing'}</Text>
+			</Box>
+			{tokenResult ? (
+				<Box marginTop={1} flexDirection="column">
+					<Text color={THEME.success}>Copy this login link to your phone:</Text>
+					<Text color={THEME.active}>{truncate(tokenResult.loginUrl, contentWidth)}</Text>
+				</Box>
+			) : null}
+			{pairing ? (
+				<Box marginTop={1} flexDirection="column">
+					<Text>Open <Text color={THEME.active}>{truncate(pairing.url, Math.max(10, contentWidth - 6))}</Text> and enter:</Text>
+					<Text color={THEME.success} bold>{pairing.code}</Text>
+					<Text color={THEME.muted}>Expires: {pairing.expiresAt}</Text>
+				</Box>
+			) : null}
+			<Box marginTop={1} flexDirection="column">
+				<Text color={THEME.muted}>e enable LAN admin · p pairing code · t rotate/copy token link · d disable</Text>
+				<Text color={THEME.muted}>r refresh · esc/R close</Text>
+			</Box>
+		</Box>
+	);
+}
+
 function HelpPane({width}: {width: number}) {
 	const rows: Array<[string, string]> = [
 		['tab', 'cycle Preview / Terminal / Git / Dev'],
@@ -370,6 +401,7 @@ function HelpPane({width}: {width: number}) {
 		['s', 'restart exited session'],
 		['d on Dev', 'start/stop dev command'],
 		['backspace', 'remove exited session'],
+		['R', 'mobile remote controls'],
 		['r', 'refresh sessions'],
 		['q', 'quit'],
 		['esc/?', 'close help'],
@@ -402,7 +434,10 @@ function footerHint(mode: Mode, activeTab: RightPaneTab, session?: SessionRecord
 		const dev = activeTab === 'dev' && session?.status === 'running' ? 'd toggle dev' : undefined;
 		const merge = session?.worktree?.path && session.worktree.mode !== 'none' && !session.worktree.deletedAt ? 'm merge' : undefined;
 		const previewFocus = activeTab === 'preview' && session?.status === 'running' ? 'v preview' : undefined;
-		return [attach, dev, merge, previewFocus, 'j/k select', 'J/K reorder', 'n new', 'N child', 'h/l resize', lifecycle, '? help', 'q quit'].filter(Boolean).join(' • ');
+		return [attach, dev, merge, previewFocus, 'j/k select', 'J/K reorder', 'n new', 'N child', 'R remote', 'h/l resize', lifecycle, '? help', 'q quit'].filter(Boolean).join(' • ');
+	}
+	if (mode === 'remote') {
+		return 'remote controls • e enable LAN · p pair · t token link · d disable · esc/R close';
 	}
 	if (mode === 'pick-program') {
 		return 'enter continue • esc cancel • j/k switch';
@@ -445,6 +480,9 @@ export function App({repoRoot, cwd, initialSelectedId, initialActiveTab, initial
 	const [dev, setDev] = useState<DevRecord>(EMPTY_DEV);
 	const [error, setError] = useState<string | undefined>();
 	const [statusMessage, setStatusMessage] = useState<string | undefined>();
+	const [remoteStatus, setRemoteStatus] = useState<RemoteControlStatus | undefined>();
+	const [remotePairing, setRemotePairing] = useState<RemotePairingInfo | undefined>();
+	const [remoteTokenResult, setRemoteTokenResult] = useState<RemoteEnableResult | undefined>();
 	const [numericSelection, setNumericSelection] = useState('');
 	const [busy, setBusy] = useState(false);
 	const [client, setClient] = useState<LiveClient | undefined>();
@@ -1118,6 +1156,83 @@ export function App({repoRoot, cwd, initialSelectedId, initialActiveTab, initial
 		}
 	}, [client, cwd, selectedSession]);
 
+	const refreshRemote = useCallback(async () => {
+		if (!client) {
+			setError('still connecting to daemon');
+			return;
+		}
+		setBusy(true);
+		setError(undefined);
+		try {
+			setRemoteStatus(await client.remoteStatus());
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client]);
+
+	const enableRemote = useCallback(async () => {
+		if (!client) return;
+		setBusy(true);
+		setError(undefined);
+		try {
+			const result = await client.enableRemote('0.0.0.0', 17345, 'admin');
+			setRemoteStatus(result);
+			setRemoteTokenResult(result);
+			setRemotePairing(undefined);
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client]);
+
+	const disableRemote = useCallback(async () => {
+		if (!client) return;
+		setBusy(true);
+		setError(undefined);
+		try {
+			setRemoteStatus(await client.disableRemote());
+			setRemotePairing(undefined);
+			setRemoteTokenResult(undefined);
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client]);
+
+	const rotateRemoteToken = useCallback(async () => {
+		if (!client) return;
+		setBusy(true);
+		setError(undefined);
+		try {
+			const result = await client.rotateRemoteToken();
+			setRemoteStatus(result);
+			setRemoteTokenResult(result);
+			setRemotePairing(undefined);
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client]);
+
+	const pairRemote = useCallback(async () => {
+		if (!client) return;
+		setBusy(true);
+		setError(undefined);
+		try {
+			setRemotePairing(await client.pairRemote());
+			setRemoteTokenResult(undefined);
+		} catch (nextError) {
+			setError(nextError instanceof Error ? nextError.message : String(nextError));
+		} finally {
+			setBusy(false);
+		}
+	}, [client]);
+
 	useInput((input, key) => {
 		if (busy) {
 			return;
@@ -1126,6 +1241,34 @@ export function App({repoRoot, cwd, initialSelectedId, initialActiveTab, initial
 		if (mode === 'help') {
 			if (key.escape || input === '?') {
 				setMode('browse');
+			}
+			return;
+		}
+
+		if (mode === 'remote') {
+			if (key.escape || input === 'R') {
+				setMode('browse');
+				return;
+			}
+			if (input === 'r') {
+				void refreshRemote();
+				return;
+			}
+			if (input === 'e') {
+				void enableRemote();
+				return;
+			}
+			if (input === 'd') {
+				void disableRemote();
+				return;
+			}
+			if (input === 't') {
+				void rotateRemoteToken();
+				return;
+			}
+			if (input === 'p') {
+				void pairRemote();
+				return;
 			}
 			return;
 		}
@@ -1206,6 +1349,13 @@ export function App({repoRoot, cwd, initialSelectedId, initialActiveTab, initial
 			}
 			if (input === '?') {
 				setMode('help');
+				return;
+			}
+			if (input === 'R') {
+				setMode('remote');
+				setRemotePairing(undefined);
+				setRemoteTokenResult(undefined);
+				void refreshRemote();
 				return;
 			}
 			if (input === 'n' || input === 'N') {
@@ -1550,6 +1700,8 @@ export function App({repoRoot, cwd, initialSelectedId, initialActiveTab, initial
 					</Box>
 				) : mode === 'help' ? (
 					<HelpPane width={layout.previewWidth} />
+				) : mode === 'remote' ? (
+					<RemotePane status={remoteStatus} pairing={remotePairing} tokenResult={remoteTokenResult} width={layout.previewWidth} />
 				) : mode === 'pick-worktree' ? (
 					<WorktreePickerPane
 						worktrees={filteredWorktrees}

@@ -16,7 +16,7 @@ import {ensureNodePtyReady} from './nodePty.js';
 import {ensureConfigDir, loadAppConfig, markAllNonExitedSessionsExited, saveAppConfig, saveSessions, sortSessionsNewestFirst, type RemoteControlConfig} from './storage.js';
 import {compareSessionOrder, sortSessionsForSidebar} from './sessionOrder.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {AgentActivityStatus, AgentSessionRef, AttachTarget, ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, RemoteControlMode, RemotePairingInfo, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
+import type {AgentActivityStatus, AgentSessionRef, AttachTarget, ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, RemoteControlMode, RemoteControlStatus, RemoteEnableResult, RemotePairingInfo, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
@@ -28,7 +28,7 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 19;
+const PROTOCOL_VERSION = 20;
 const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_REMOTE_HOST = '127.0.0.1';
 const DEFAULT_REMOTE_PORT = 17345;
@@ -323,28 +323,40 @@ const MOBILE_HTML = String.raw`<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <title>Deckhand Remote</title>
 <style>
-:root{color-scheme:dark;--bg:#0b0d12;--panel:#151923;--muted:#8b93a7;--text:#edf1f7;--accent:#7dd3fc;--danger:#f87171;--ok:#86efac;--border:#293042}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,-apple-system,Segoe UI,sans-serif}.app{max-width:900px;margin:0 auto;padding:14px;padding-bottom:90px}.top{position:sticky;top:0;background:linear-gradient(var(--bg) 80%,transparent);z-index:2;padding:8px 0 12px}h1{font-size:22px;margin:0 0 4px}.muted{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}.row{display:flex;align-items:center;gap:10px;justify-content:space-between}.sessions button{width:100%;text-align:left;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px;margin:6px 0}.title{font-weight:700}.status{font-size:12px;color:var(--muted)}.tabs,.actions{display:flex;gap:8px;overflow:auto;padding:8px 0}.tabs button,.actions button,.primary{border:1px solid var(--border);background:#101521;color:var(--text);border-radius:999px;padding:9px 12px;white-space:nowrap}.tabs button.active{border-color:var(--accent);color:var(--accent)}button.danger{border-color:#7f1d1d;color:var(--danger)}button.ok{border-color:#14532d;color:var(--ok)}pre{white-space:pre-wrap;word-break:break-word;background:#05070a;border:1px solid var(--border);border-radius:12px;padding:12px;min-height:45vh;max-height:62vh;overflow:auto;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.25}textarea,input,select{width:100%;background:#070a10;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px;font:16px system-ui;margin:6px 0}dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:16px;width:min(92vw,520px)}.hidden{display:none}.pill{border-radius:999px;padding:3px 8px;background:#101521;color:var(--muted);font-size:12px}.err{color:var(--danger)}
+:root{color-scheme:dark;--bg:#0b0d12;--panel:#151923;--panel2:#101521;--muted:#8b93a7;--text:#edf1f7;--accent:#7dd3fc;--danger:#f87171;--ok:#86efac;--warn:#fde68a;--border:#293042}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,-apple-system,Segoe UI,sans-serif}.app{max-width:900px;margin:0 auto;padding:14px;padding-bottom:90px}.top{position:sticky;top:0;background:linear-gradient(var(--bg) 80%,transparent);z-index:2;padding:8px 0 12px}h1{font-size:22px;margin:0 0 4px}h2{font-size:18px;margin:0 0 8px}.muted{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}.row{display:flex;align-items:center;gap:10px;justify-content:space-between}.sessions button{width:100%;text-align:left;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px;margin:6px 0}.sessions button.needs{border-color:#854d0e}.title{font-weight:700}.status{font-size:12px;color:var(--muted)}.tail{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1;background:#070a10;border:1px solid var(--border);border-radius:10px;margin-top:8px;padding:8px;white-space:pre-wrap;max-height:7.5em;overflow:hidden}.tabs,.actions,.chips{display:flex;gap:8px;overflow:auto;padding:8px 0;flex-wrap:wrap}.tabs button,.actions button,.chips button,.primary{border:1px solid var(--border);background:var(--panel2);color:var(--text);border-radius:999px;padding:9px 12px;white-space:nowrap}.tabs button.active{border-color:var(--accent);color:var(--accent)}button.danger{border-color:#7f1d1d;color:var(--danger)}button.ok{border-color:#14532d;color:var(--ok)}button.warn{border-color:#854d0e;color:var(--warn)}pre{white-space:pre;word-break:normal;background:#05070a;border:1px solid var(--border);border-radius:12px;padding:8px;min-height:32vh;max-height:48vh;overflow:auto;font:10.5px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.18;-webkit-text-size-adjust:100%}textarea,input,select{width:100%;background:#070a10;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px;font:16px system-ui;margin:6px 0}details{margin-top:8px}summary{color:var(--muted);padding:8px 0}.hidden{display:none}.pill{border-radius:999px;padding:3px 8px;background:var(--panel2);color:var(--muted);font-size:12px}.pill.active{color:var(--accent)}.pill.idle{color:var(--warn)}.pill.exited{color:var(--danger)}.err{color:var(--danger)}.hint{font-size:13px;color:var(--muted);line-height:1.35}.toast{position:fixed;left:14px;right:14px;bottom:14px;background:#052e16;color:var(--ok);border:1px solid #14532d;border-radius:12px;padding:10px;display:none}.toast.show{display:block}
 </style>
 </head>
 <body><div class="app">
 <div class="top"><div class="row"><div><h1>Deckhand</h1><div id="conn" class="muted">connecting…</div></div><button class="primary" onclick="refresh()">Refresh</button></div></div>
-<section id="login" class="card hidden"><h2>Remote login</h2><p class="muted">Enter the remote token from <code>deckhand remote token</code>, or a pairing code from <code>deckhand remote pair</code>.</p><input id="token" placeholder="Token" autocomplete="off"/><button class="primary" onclick="saveToken()">Use token</button><input id="pair" placeholder="Pairing code" inputmode="numeric"/><button onclick="pairDevice()">Pair device</button><p id="loginErr" class="err"></p></section>
+<section id="login" class="card hidden"><h2>Remote login</h2><p class="muted">Enter a token login link from Deckhand, or a pairing code from the desktop TUI.</p><input id="token" placeholder="Token" autocomplete="off"/><button class="primary" onclick="saveToken()">Use token</button><input id="pair" placeholder="Pairing code" inputmode="numeric"/><button onclick="pairDevice()">Pair device</button><p id="loginErr" class="err"></p></section>
 <section id="list" class="sessions"></section>
-<section id="detail" class="hidden"><button onclick="back()">← Sessions</button><div class="card"><div class="row"><div><div id="sTitle" class="title"></div><div id="sMeta" class="status"></div></div><span id="sState" class="pill"></span></div><div class="tabs"><button id="tab-preview" onclick="setTab('preview')">Preview</button><button id="tab-terminal" onclick="setTab('terminal')">Terminal</button><button id="tab-git" onclick="setTab('git')">Git</button><button id="tab-dev" onclick="setTab('dev')">Dev</button></div><pre id="pane"></pre><textarea id="input" rows="3" placeholder="Send input to selected tab…"></textarea><div class="actions"><button class="ok" onclick="sendInput(true)">Send Enter</button><button onclick="sendInput(false)">Send Raw</button><button onclick="quick('\u0003',false)">Ctrl-C</button><button onclick="quick('\u001b',false)">Esc</button><button onclick="quick('\t',false)">Tab</button></div><div class="actions"><button onclick="act('start-dev')">Start Dev</button><button onclick="act('stop-dev')">Stop Dev</button><button onclick="act('restart')">Restart</button><button class="danger" onclick="danger('kill')">Kill</button><button class="danger" onclick="danger('remove')">Remove</button></div></div></section>
-<section id="new" class="card"><h2>New session</h2><input id="newTitle" placeholder="Title"/><select id="newProgram"><option>claude</option><option>pi</option><option>codex</option></select><input id="newCwd" placeholder="Remote cwd, e.g. /Users/me/project"/><select id="newWorktree"><option value="none">No worktree</option><option value="new">New worktree</option></select><button class="primary" onclick="createSession()">Create</button><p id="newErr" class="err"></p></section>
+<section id="detail" class="hidden"><button onclick="back()">← Sessions</button><div class="card"><div class="row"><div><div id="sTitle" class="title"></div><div id="sMeta" class="status"></div></div><span id="sState" class="pill"></span></div><p class="hint">Use this as an agent cockpit: read the latest output, then send high-level steering prompts instead of trying to drive a full terminal.</p><div class="tabs"><button id="tab-preview" onclick="setTab('preview')">Preview</button><button id="tab-terminal" onclick="setTab('terminal')">Terminal</button><button id="tab-git" onclick="setTab('git')">Git</button><button id="tab-dev" onclick="setTab('dev')">Dev</button></div><pre id="pane"></pre>
+<div class="card"><h2>Steer agent</h2><textarea id="steerInput" rows="3" placeholder="Tell the agent what to do next…"></textarea><div class="actions"><button class="ok" onclick="sendSteer()">Send to agent</button><button onclick="promptSteer('Please continue from where you left off.')">Continue</button><button onclick="promptSteer('Please run the relevant tests and fix any failures.')">Run tests</button><button onclick="promptSteer('Briefly summarize what you did, current state, and what you need from me.')">Status digest</button><button onclick="promptSteer('What is blocking you or what decision do you need from me?')">What is blocking?</button><button onclick="promptSteer('Please make a smaller, safer change and explain the plan before continuing.')">Smaller change</button><button onclick="promptSteer('Please stop after the current step and summarize the result.')">Stop after step</button></div></div>
+<details><summary>Advanced terminal controls</summary><textarea id="input" rows="3" placeholder="Send raw input to selected tab…"></textarea><div class="actions"><button class="ok" onclick="sendInput(true)">Send Enter</button><button onclick="sendInput(false)">Send Raw</button><button onclick="quick('\u0003',false)">Ctrl-C</button><button onclick="quick('\u001b',false)">Esc</button><button onclick="quick('\t',false)">Tab</button></div><div class="actions"><button onclick="act('start-dev')">Start Dev</button><button onclick="act('stop-dev')">Stop Dev</button><button onclick="act('restart')">Restart</button><button class="danger" onclick="danger('kill')">Kill</button><button class="danger" onclick="danger('remove')">Remove</button></div></details></div></section>
+<section id="new" class="card"><h2>New session</h2><p class="hint">Best from phone for quick experiments or follow-up tasks. Use desktop Deckhand for complex setup.</p><input id="newTitle" placeholder="Title"/><select id="newProgram"><option>claude</option><option>pi</option><option>codex</option></select><input id="newCwd" placeholder="Remote cwd, e.g. /Users/me/project"/><select id="newWorktree"><option value="none">No worktree</option><option value="new">New worktree</option></select><button class="primary" onclick="createSession()">Create</button><p id="newErr" class="err"></p></section>
+<div id="toast" class="toast"></div>
 </div><script>
 let token=new URLSearchParams(location.hash.replace(/^#/, '')).get('token')||localStorage.getItem('deckhandToken')||'';if(location.hash&&token){localStorage.setItem('deckhandToken',token);history.replaceState(null,'',location.pathname);}let sessions=[];let selected='';let tab='preview';let timer=0;
 const $=id=>document.getElementById(id);function headers(){return token?{authorization:'Bearer '+token}:{};}async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{'content-type':'application/json',...headers(),...(opts.headers||{})}});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j;}
+function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1800);}
 async function refresh(){try{const st=await api('/api/status');$('conn').textContent='mobile · '+(st.remote.host||'')+':'+(st.remote.port||'')+' · '+st.remote.mode+(st.authenticated?' · authenticated':'');$('login').classList.toggle('hidden',st.authenticated);if(!st.authenticated)return;const data=await api('/api/sessions');sessions=data.sessions||[];renderList();if(selected)await loadPane();}catch(e){$('conn').textContent='error: '+e.message;$('login').classList.remove('hidden');}}
-function renderList(){const el=$('list');el.innerHTML='';sessions.forEach(s=>{const b=document.createElement('button');b.innerHTML='<div class="row"><div><div class="title">'+esc(s.title)+'</div><div class="status">'+esc(s.program)+' · '+esc(short(s.cwd))+'</div></div><span class="pill">'+esc(s.agentStatus||s.status)+'</span></div>';b.onclick=()=>openSession(s.id);el.appendChild(b);});}
-async function openSession(id){selected=id;$('list').classList.add('hidden');$('new').classList.add('hidden');$('detail').classList.remove('hidden');await loadPane();timer&&clearInterval(timer);timer=setInterval(loadPane,2000);}function back(){selected='';clearInterval(timer);$('detail').classList.add('hidden');$('list').classList.remove('hidden');$('new').classList.remove('hidden');}
+function needsAttention(s){return s.status==='exited'||s.agentStatus==='idle'||s.agentStatus==='unknown';}
+function stateLabel(s){return s.status==='exited'?'exited':(s.agentStatus||s.status||'unknown');}
+function stateClass(s){const x=stateLabel(s);return x==='active'?'active':x==='idle'||x==='unknown'?'idle':x==='exited'?'exited':'';}
+function previewTail(s){const t=String(s.mobilePreviewTail||s.lastPreview||'').trim().split('\n').slice(-5).join('\n');return t||'Tap to view live preview and steer this agent.';}
+function renderList(){const el=$('list');el.innerHTML='';if(!sessions.length){el.innerHTML='<div class="card muted">No sessions yet.</div>';return;}sessions.forEach(s=>{const b=document.createElement('button');b.className=needsAttention(s)?'needs':'';b.innerHTML='<div class="row"><div><div class="title">'+esc(s.title)+'</div><div class="status">'+esc(s.program)+' · '+esc(short(s.cwd))+'</div></div><span class="pill '+stateClass(s)+'">'+esc(stateLabel(s))+'</span></div><div class="tail">'+esc(previewTail(s))+'</div>';b.onclick=()=>openSession(s.id);el.appendChild(b);});}
+async function openSession(id){selected=id;$('list').classList.add('hidden');$('new').classList.add('hidden');$('detail').classList.remove('hidden');await loadPane();timer&&clearInterval(timer);timer=setInterval(loadPane,2000);}function back(){selected='';clearInterval(timer);$('detail').classList.add('hidden');$('list').classList.remove('hidden');$('new').classList.remove('hidden');refresh();}
 function setTab(t){tab=t;loadPane();}function activeTabs(){['preview','terminal','git','dev'].forEach(t=>$('tab-'+t).classList.toggle('active',t===tab));}
-async function loadPane(){if(!selected)return;activeTabs();const s=sessions.find(x=>x.id===selected)||{};$('sTitle').textContent=s.title||selected;$('sMeta').textContent=(s.program||'')+' · '+(s.cwd||'');$('sState').textContent=s.agentStatus||s.status||'';const path=tab==='preview'?'/preview':'/'+tab;const j=await api('/api/sessions/'+selected+path);const rec=j.preview||j.terminal||j.git||j.dev||{};$('pane').textContent=rec.content||'';}
-async function sendInput(enter){const data=$('input').value;if(!data&&!enter)return;await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:tab==='preview'?'agent':tab,data,enter})});$('input').value='';setTimeout(loadPane,300);}async function quick(data,enter){await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:tab==='preview'?'agent':tab,data,enter})});setTimeout(loadPane,300);}
-async function act(a){await api('/api/sessions/'+selected+'/'+a,{method:'POST',body:'{}'});setTimeout(refresh,500);}async function danger(a){const s=sessions.find(x=>x.id===selected);if(!confirm(a+' '+(s?.title||selected)+' on remote Deckhand?'))return;await act(a);if(a==='remove')back();}
+function paneSize(){const el=$('pane');const width=(el?.clientWidth||window.innerWidth)-18;const cols=Math.max(44,Math.min(88,Math.floor(width/5.9)));const rows=Math.max(18,Math.min(30,Math.floor(window.innerHeight/26)));return {cols,rows};}
+async function loadPane(){if(!selected)return;activeTabs();const s=sessions.find(x=>x.id===selected)||{};$('sTitle').textContent=s.title||selected;$('sMeta').textContent=(s.program||'')+' · '+(s.cwd||'');$('sState').textContent=stateLabel(s);$('sState').className='pill '+stateClass(s);const path=tab==='preview'?'/preview':'/'+tab;const size=paneSize();const j=await api('/api/sessions/'+selected+path+'?cols='+size.cols+'&rows='+size.rows);const rec=j.preview||j.terminal||j.git||j.dev||{};$('pane').textContent=rec.content||'';$('pane').scrollTop=$('pane').scrollHeight;}
+async function sendAgent(data){if(!selected||!data)return;await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:'agent',data,enter:true})});setTimeout(loadPane,300);toast('Sent to agent');}
+async function sendSteer(){const el=$('steerInput');const data=el.value.trim();if(!data)return;await sendAgent(data);el.value='';}
+function promptSteer(text){$('steerInput').value=text;sendSteer();}
+async function sendInput(enter){const data=$('input').value;if(!data&&!enter)return;await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:tab==='preview'?'agent':tab,data,enter})});$('input').value='';setTimeout(loadPane,300);toast('Sent input');}async function quick(data,enter){await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:tab==='preview'?'agent':tab,data,enter})});setTimeout(loadPane,300);toast('Sent');}
+async function act(a){await api('/api/sessions/'+selected+'/'+a,{method:'POST',body:'{}'});setTimeout(refresh,500);toast(a+' requested');}async function danger(a){const s=sessions.find(x=>x.id===selected);if(!confirm(a+' '+(s?.title||selected)+' on remote Deckhand?'))return;await act(a);if(a==='remove')back();}
 function saveToken(){token=$('token').value.trim();localStorage.setItem('deckhandToken',token);refresh();}async function pairDevice(){try{const j=await api('/api/pair',{method:'POST',body:JSON.stringify({code:$('pair').value.trim()})});token=j.token;localStorage.setItem('deckhandToken',token);$('loginErr').textContent='';refresh();}catch(e){$('loginErr').textContent=e.message;}}
-async function createSession(){try{const body={title:$('newTitle').value,program:$('newProgram').value,cwd:$('newCwd').value,worktreeMode:$('newWorktree').value,cols:100,rows:34};await api('/api/create',{method:'POST',body:JSON.stringify(body)});$('newErr').textContent='';$('newTitle').value='';refresh();}catch(e){$('newErr').textContent=e.message;}}
-function esc(s){return String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}function short(s){s=String(s||'');return s.length>42?'…'+s.slice(-41):s;}refresh();setInterval(refresh,10000);
+async function createSession(){try{const body={title:$('newTitle').value,program:$('newProgram').value,cwd:$('newCwd').value,worktreeMode:$('newWorktree').value,cols:100,rows:34};await api('/api/create',{method:'POST',body:JSON.stringify(body)});$('newErr').textContent='';$('newTitle').value='';refresh();toast('Session created');}catch(e){$('newErr').textContent=e.message;}}
+function esc(s){return String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}function short(s){s=String(s||'');return s.length>42?'…'+s.slice(-41):s;}window.addEventListener('resize',()=>{if(selected)loadPane();});refresh();setInterval(refresh,10000);
 </script></body></html>`;
 
 
@@ -470,6 +482,62 @@ export class InkDaemon {
 			this.remoteServer?.listen(port, host, () => resolve());
 		});
 		await this.log(`remote mobile control listening http://${host}:${port} mode=${mode}`);
+	}
+
+	private async closeRemoteServer(): Promise<void> {
+		const server = this.remoteServer;
+		this.remoteServer = undefined;
+		this.remoteConfig = undefined;
+		this.remotePairing = undefined;
+		if (!server) return;
+		await new Promise<void>(resolve => server.close(() => resolve()));
+	}
+
+	private async remoteStatus(): Promise<RemoteControlStatus> {
+		const config = await loadAppConfig();
+		const remote = config.remote_control;
+		const host = this.remoteConfig?.host || remote?.host || DEFAULT_REMOTE_HOST;
+		const port = this.remoteConfig?.port || remote?.port || DEFAULT_REMOTE_PORT;
+		const mode = this.remoteConfig?.mode || remote?.mode || DEFAULT_REMOTE_MODE;
+		return {
+			enabled: Boolean(remote?.enabled),
+			listening: Boolean(this.remoteServer && this.remoteConfig),
+			host,
+			port,
+			mode,
+			url: remoteHttpUrl(host, port),
+			tokenConfigured: Boolean(this.remoteConfig?.tokenHash || remote?.tokenHash),
+		};
+	}
+
+	private async enableRemote(host = '0.0.0.0', port = DEFAULT_REMOTE_PORT, mode: RemoteControlMode = DEFAULT_REMOTE_MODE): Promise<RemoteEnableResult> {
+		if (!Number.isFinite(port) || port <= 0 || port > 65535) throw new Error('remote port must be a TCP port');
+		const config = await loadAppConfig();
+		const token = randomBytes(24).toString('base64url');
+		await saveAppConfig({...config, remote_control: {enabled: true, host, port, mode, tokenHash: sha256(token)}});
+		await this.closeRemoteServer();
+		await this.listenRemoteIfEnabled();
+		return {...await this.remoteStatus(), token, loginUrl: remoteHttpUrl(host, port, `/#token=${token}`)};
+	}
+
+	private async disableRemote(): Promise<RemoteControlStatus> {
+		const config = await loadAppConfig();
+		await saveAppConfig({...config, remote_control: {...config.remote_control, enabled: false}});
+		await this.closeRemoteServer();
+		return this.remoteStatus();
+	}
+
+	private async rotateRemoteToken(): Promise<RemoteEnableResult> {
+		const config = await loadAppConfig();
+		const current = config.remote_control;
+		const host = current?.host || this.remoteConfig?.host || DEFAULT_REMOTE_HOST;
+		const port = current?.port || this.remoteConfig?.port || DEFAULT_REMOTE_PORT;
+		const mode = current?.mode || this.remoteConfig?.mode || DEFAULT_REMOTE_MODE;
+		const token = randomBytes(24).toString('base64url');
+		const tokenHash = sha256(token);
+		await saveAppConfig({...config, remote_control: {...current, enabled: current?.enabled ?? true, host, port, mode, tokenHash}});
+		if (this.remoteConfig) this.remoteConfig.tokenHash = tokenHash;
+		return {...await this.remoteStatus(), token, loginUrl: remoteHttpUrl(host, port, `/#token=${token}`)};
 	}
 
 	private setupProcessHandlers(): void {
@@ -714,6 +782,18 @@ export class InkDaemon {
 			switch (message.type) {
 				case 'ping':
 					sendMessage(socket, response(message.requestId, {ok: true, version: PROTOCOL_VERSION}));
+					return;
+				case 'remote-status':
+					sendMessage(socket, response(message.requestId, await this.remoteStatus()));
+					return;
+				case 'remote-enable':
+					sendMessage(socket, response(message.requestId, await this.enableRemote(message.host, message.port, message.mode)));
+					return;
+				case 'remote-disable':
+					sendMessage(socket, response(message.requestId, await this.disableRemote()));
+					return;
+				case 'remote-token':
+					sendMessage(socket, response(message.requestId, await this.rotateRemoteToken()));
 					return;
 				case 'remote-pair':
 					sendMessage(socket, response(message.requestId, this.createRemotePairing()));
@@ -1193,7 +1273,11 @@ export class InkDaemon {
 		const parts = request.pathname.split('/').filter(Boolean);
 		if (request.pathname === '/api/sessions' && request.method === 'GET') {
 			this.assertRemotePermission('read');
-			this.sendHttp(response, 200, {sessions: sortSessionsForSidebar([...this.sessions.values()])});
+			const sessions = sortSessionsForSidebar([...this.sessions.values()]).map(session => ({
+				...session,
+				mobilePreviewTail: this.runtime.get(session.id)?.preview.getCachedSnapshot() || session.lastPreview || '',
+			}));
+			this.sendHttp(response, 200, {sessions});
 			return;
 		}
 		if (request.pathname === '/api/create' && request.method === 'POST') {

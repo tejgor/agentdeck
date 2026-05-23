@@ -13,7 +13,7 @@ import {
 	getSocketPath,
 	isDevRuntime,
 } from './paths.js';
-import type {ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, ServerMessage, SessionRecord, TerminalRecord, WorktreeInfoRecord, WorktreeMergeMode, WorktreeMergeResult} from './types.js';
+import type {ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, RemoteControlMode, RemoteControlStatus, RemoteEnableResult, RemotePairingInfo, ServerMessage, SessionRecord, TerminalRecord, WorktreeInfoRecord, WorktreeMergeMode, WorktreeMergeResult} from './types.js';
 
 function createConnection(): Promise<net.Socket> {
 	const socketPath = getSocketPath();
@@ -84,7 +84,7 @@ export async function request<T = unknown>(message: Extract<ClientRequest, {requ
 	});
 }
 
-const PROTOCOL_VERSION = 19;
+const PROTOCOL_VERSION = 20;
 
 class ProtocolMismatchError extends Error {}
 
@@ -426,6 +426,26 @@ export class LiveClient {
 
 	removeSession(sessionId: string): Promise<void> {
 		return this.request({type: 'remove', requestId: randomUUID(), sessionId});
+	}
+
+	remoteStatus(): Promise<RemoteControlStatus> {
+		return this.request<RemoteControlStatus>({type: 'remote-status', requestId: randomUUID()});
+	}
+
+	enableRemote(host = '0.0.0.0', port = 17345, mode: RemoteControlMode = 'admin'): Promise<RemoteEnableResult> {
+		return this.request<RemoteEnableResult>({type: 'remote-enable', requestId: randomUUID(), host, port, mode});
+	}
+
+	disableRemote(): Promise<RemoteControlStatus> {
+		return this.request<RemoteControlStatus>({type: 'remote-disable', requestId: randomUUID()});
+	}
+
+	rotateRemoteToken(): Promise<RemoteEnableResult> {
+		return this.request<RemoteEnableResult>({type: 'remote-token', requestId: randomUUID()});
+	}
+
+	pairRemote(): Promise<RemotePairingInfo> {
+		return this.request<RemotePairingInfo>({type: 'remote-pair', requestId: randomUUID()});
 	}
 
 	sendAgentInput(sessionId: string, data: string): void {

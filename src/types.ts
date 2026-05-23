@@ -134,8 +134,27 @@ export interface RemotePairingInfo {
 	url: string;
 }
 
+export interface RemoteControlStatus {
+	enabled: boolean;
+	listening: boolean;
+	host: string;
+	port: number;
+	mode: RemoteControlMode;
+	url: string;
+	tokenConfigured: boolean;
+}
+
+export interface RemoteEnableResult extends RemoteControlStatus {
+	token: string;
+	loginUrl: string;
+}
+
 export type ClientRequest =
 	| {type: 'ping'; requestId: string}
+	| {type: 'remote-status'; requestId: string}
+	| {type: 'remote-enable'; requestId: string; host?: string; port?: number; mode?: RemoteControlMode}
+	| {type: 'remote-disable'; requestId: string}
+	| {type: 'remote-token'; requestId: string}
 	| {type: 'remote-pair'; requestId: string}
 	| {type: 'list'; requestId: string}
 	| {type: 'subscribe'; requestId: string; repoRoot: string}

@@ -34,6 +34,8 @@ Implemented behavior:
 - stale-session cleanup after daemon restart
 - daemon PID/log files and protocol-version safeguards
 - optional authenticated mobile remote-control web UI served by the daemon
+- in-app mobile remote controls for enabling/disabling, pairing, and rotating login links without restarting the daemon
+- mobile web UI oriented as an agent cockpit: status cards, preview tails, quick steering prompts, and advanced terminal controls tucked behind details
 
 ## Architecture
 
@@ -176,6 +178,15 @@ CLI commands:
 - `deckhand remote status`
 - `deckhand remote token` rotates and prints a new bearer token
 - `deckhand remote pair` uses local IPC request `remote-pair` to create a 5-minute pairing code; successful `/api/pair` rotates/persists a new token and returns it to the browser
+- In the TUI, press `R` to open mobile remote controls. From there: `e` enables LAN/admin remote live on `0.0.0.0:17345` and prints a copyable login URL, `p` creates a pairing code, `t` rotates/prints a login URL, `d` disables the listener live, `r` refreshes status, and `esc`/`R` closes.
+
+Mobile UI design:
+
+- Treat phone use as triage + lightweight steering, not full terminal attach.
+- Session cards emphasize active/idle/unknown/exited state and show a cached preview tail when available.
+- Detail view keeps Preview/Terminal/Git/Dev snapshots but foregrounds a `Steer agent` box.
+- Quick steering buttons send prompts to the agent PTY: Continue, Run tests, Status digest, What is blocking?, Smaller change, Stop after step.
+- Raw tab input, Ctrl-C/Esc/Tab, Dev/restart/kill/remove remain available under `Advanced terminal controls`.
 
 HTTP routes in `src/daemon.ts`:
 
@@ -311,7 +322,7 @@ Config currently includes:
 Protocol:
 
 - line-delimited JSON
-- current protocol version: **v19**
+- current protocol version: **v20**
 
 If an older daemon is still running:
 
@@ -371,6 +382,10 @@ Tracked metadata includes:
 Supported request types include:
 
 - `ping`
+- `remote-status`
+- `remote-enable`
+- `remote-disable`
+- `remote-token`
 - `remote-pair`
 - `list`
 - `subscribe`
