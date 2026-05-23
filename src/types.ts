@@ -126,8 +126,17 @@ export interface CreateSessionInput {
 	subSessionKind?: SubSessionKind;
 }
 
+export type RemoteControlMode = 'read-only' | 'interactive' | 'admin';
+
+export interface RemotePairingInfo {
+	code: string;
+	expiresAt: string;
+	url: string;
+}
+
 export type ClientRequest =
 	| {type: 'ping'; requestId: string}
+	| {type: 'remote-pair'; requestId: string}
 	| {type: 'list'; requestId: string}
 	| {type: 'subscribe'; requestId: string; repoRoot: string}
 	| {type: 'list-worktrees'; requestId: string; cwd: string}

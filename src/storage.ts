@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {getConfigDir, getConfigPath, getStatePath} from './paths.js';
-import type {SessionRecord} from './types.js';
+import type {RemoteControlMode, SessionRecord} from './types.js';
 
 interface InkState {
 	sessions: SessionRecord[];
@@ -11,12 +11,22 @@ interface InkState {
 export interface AppConfig {
 	dev_command?: string;
 	attach_scroll_sensitivity?: number;
+	remote_control?: RemoteControlConfig;
+}
+
+export interface RemoteControlConfig {
+	enabled?: boolean;
+	host?: string;
+	port?: number;
+	mode?: RemoteControlMode;
+	tokenHash?: string;
 }
 
 const EMPTY_STATE: InkState = {sessions: []};
 
 export async function ensureConfigDir(): Promise<void> {
-	await fs.mkdir(getConfigDir(), {recursive: true});
+	await fs.mkdir(getConfigDir(), {recursive: true, mode: 0o700});
+	await fs.chmod(getConfigDir(), 0o700).catch(() => {});
 }
 
 export async function loadState(): Promise<InkState> {
@@ -107,9 +117,18 @@ export async function loadAppConfig(): Promise<AppConfig> {
 	try {
 		const raw = await fs.readFile(getConfigPath(), 'utf8');
 		const parsed = JSON.parse(raw) as Partial<AppConfig>;
+		const remote = parsed.remote_control as Partial<RemoteControlConfig> | undefined;
+		const remoteMode = remote?.mode === 'read-only' || remote?.mode === 'interactive' || remote?.mode === 'admin' ? remote.mode : undefined;
 		return {
 			dev_command: typeof parsed.dev_command === 'string' ? parsed.dev_command : undefined,
 			attach_scroll_sensitivity: typeof parsed.attach_scroll_sensitivity === 'number' ? parsed.attach_scroll_sensitivity : undefined,
+			remote_control: remote ? {
+				enabled: remote.enabled === true,
+				host: typeof remote.host === 'string' ? remote.host : undefined,
+				port: typeof remote.port === 'number' ? remote.port : undefined,
+				mode: remoteMode,
+				tokenHash: typeof remote.tokenHash === 'string' ? remote.tokenHash : undefined,
+			} : undefined,
 		};
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
@@ -118,6 +137,15 @@ export async function loadAppConfig(): Promise<AppConfig> {
 		}
 		throw error;
 	}
+}
+
+export async function saveAppConfig(config: AppConfig): Promise<void> {
+	await ensureConfigDir();
+	const configPath = getConfigPath();
+	const temporaryPath = `${configPath}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
+	await fs.writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, {encoding: 'utf8', mode: 0o600});
+	await fs.rename(temporaryPath, configPath);
+	await fs.chmod(configPath, 0o600).catch(() => {});
 }
 
 export function stateFileDisplayPath(): string {

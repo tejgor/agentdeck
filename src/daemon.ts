@@ -3,17 +3,20 @@ import {constants as fsConstants} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import http, {type IncomingMessage, type ServerResponse as HttpServerResponse} from 'node:http';
+import {createHash, randomBytes, timingSafeEqual} from 'node:crypto';
 import {execFile, fork, type ChildProcess} from 'node:child_process';
 import {promisify} from 'node:util';
 import {randomUUID} from 'node:crypto';
 import pty, {type IPty} from 'node-pty';
 import {getCliEntryPath, getDaemonLogPath, getDaemonPidPath, getSocketPath, getWorkerDir, getWorkerLogPath, getWorkerPidPath} from './paths.js';
 import {createWorktreeForSession, deleteLocalBranch, findRepoRoot, listWorktrees, mergeWorktreeIntoCurrent, removeWorktree, sanitizeWorktreeName} from './git.js';
+import {remoteHttpUrl} from './network.js';
 import {ensureNodePtyReady} from './nodePty.js';
-import {ensureConfigDir, loadAppConfig, markAllNonExitedSessionsExited, saveSessions, sortSessionsNewestFirst} from './storage.js';
+import {ensureConfigDir, loadAppConfig, markAllNonExitedSessionsExited, saveAppConfig, saveSessions, sortSessionsNewestFirst, type RemoteControlConfig} from './storage.js';
 import {compareSessionOrder, sortSessionsForSidebar} from './sessionOrder.js';
 import {TerminalPreview} from './terminalPreview.js';
-import type {AgentActivityStatus, AgentSessionRef, AttachTarget, ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
+import type {AgentActivityStatus, AgentSessionRef, AttachTarget, ClientRequest, CreateSessionInput, DevRecord, GitRecord, PreviewRecord, RemoteControlMode, RemotePairingInfo, ServerMessage, ServerResponse, SessionRecord, TerminalRecord} from './types.js';
 
 const execFileAsync = promisify(execFile);
 const SCROLLBACK_LIMIT = 200_000;
@@ -25,8 +28,14 @@ const ACTIVITY_WINDOW_MS = 3000;
 const IDLE_AFTER_MS = 5000;
 const ACTIVE_MIN_CHANGED_CHARS = 1;
 const RESIZE_ACTIVITY_SUPPRESSION_MS = 750;
-const PROTOCOL_VERSION = 18;
+const PROTOCOL_VERSION = 19;
 const WORKER_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_REMOTE_HOST = '127.0.0.1';
+const DEFAULT_REMOTE_PORT = 17345;
+const DEFAULT_REMOTE_MODE: RemoteControlMode = 'admin';
+const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
+const MOBILE_PREVIEW_COLS = 100;
+const MOBILE_PREVIEW_ROWS = 34;
 
 interface RuntimeSession {
 	term: IPty;
@@ -81,6 +90,18 @@ interface WorkerRuntime {
 	exited?: boolean;
 }
 
+interface RemotePairingState {
+	code: string;
+	expiresAt: number;
+}
+
+interface RemoteHttpRequest {
+	method: string;
+	pathname: string;
+	query: URLSearchParams;
+	body?: unknown;
+}
+
 type WorkerEvent =
 	| {type: 'response'; requestId: string; ok: true; data?: unknown}
 	| {type: 'response'; requestId: string; ok: false; error: string}
@@ -92,6 +113,19 @@ type WorkerEvent =
 	| {type: 'git-updated'; git: GitRecord}
 	| {type: 'dev-updated'; dev: DevRecord}
 	| {type: 'output'; target: AttachTarget; data: string};
+
+function sha256(value: string): string {
+	return createHash('sha256').update(value).digest('hex');
+}
+
+function verifySecret(secret: string, expectedHash: string | undefined): boolean {
+	if (!expectedHash || !/^[a-f0-9]{64}$/i.test(expectedHash)) {
+		return false;
+	}
+	const actual = Buffer.from(sha256(secret), 'hex');
+	const expected = Buffer.from(expectedHash, 'hex');
+	return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 
 function sendMessage(socket: net.Socket, message: ServerMessage): void {
 	if (!socket.destroyed) {
@@ -282,6 +316,38 @@ function signalPtyProcess(term: IPty, signal: NodeJS.Signals, forceGroup = false
 	}
 }
 
+const MOBILE_HTML = String.raw`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Deckhand Remote</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d12;--panel:#151923;--muted:#8b93a7;--text:#edf1f7;--accent:#7dd3fc;--danger:#f87171;--ok:#86efac;--border:#293042}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,-apple-system,Segoe UI,sans-serif}.app{max-width:900px;margin:0 auto;padding:14px;padding-bottom:90px}.top{position:sticky;top:0;background:linear-gradient(var(--bg) 80%,transparent);z-index:2;padding:8px 0 12px}h1{font-size:22px;margin:0 0 4px}.muted{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}.row{display:flex;align-items:center;gap:10px;justify-content:space-between}.sessions button{width:100%;text-align:left;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px;margin:6px 0}.title{font-weight:700}.status{font-size:12px;color:var(--muted)}.tabs,.actions{display:flex;gap:8px;overflow:auto;padding:8px 0}.tabs button,.actions button,.primary{border:1px solid var(--border);background:#101521;color:var(--text);border-radius:999px;padding:9px 12px;white-space:nowrap}.tabs button.active{border-color:var(--accent);color:var(--accent)}button.danger{border-color:#7f1d1d;color:var(--danger)}button.ok{border-color:#14532d;color:var(--ok)}pre{white-space:pre-wrap;word-break:break-word;background:#05070a;border:1px solid var(--border);border-radius:12px;padding:12px;min-height:45vh;max-height:62vh;overflow:auto;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.25}textarea,input,select{width:100%;background:#070a10;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px;font:16px system-ui;margin:6px 0}dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:16px;width:min(92vw,520px)}.hidden{display:none}.pill{border-radius:999px;padding:3px 8px;background:#101521;color:var(--muted);font-size:12px}.err{color:var(--danger)}
+</style>
+</head>
+<body><div class="app">
+<div class="top"><div class="row"><div><h1>Deckhand</h1><div id="conn" class="muted">connecting…</div></div><button class="primary" onclick="refresh()">Refresh</button></div></div>
+<section id="login" class="card hidden"><h2>Remote login</h2><p class="muted">Enter the remote token from <code>deckhand remote token</code>, or a pairing code from <code>deckhand remote pair</code>.</p><input id="token" placeholder="Token" autocomplete="off"/><button class="primary" onclick="saveToken()">Use token</button><input id="pair" placeholder="Pairing code" inputmode="numeric"/><button onclick="pairDevice()">Pair device</button><p id="loginErr" class="err"></p></section>
+<section id="list" class="sessions"></section>
+<section id="detail" class="hidden"><button onclick="back()">← Sessions</button><div class="card"><div class="row"><div><div id="sTitle" class="title"></div><div id="sMeta" class="status"></div></div><span id="sState" class="pill"></span></div><div class="tabs"><button id="tab-preview" onclick="setTab('preview')">Preview</button><button id="tab-terminal" onclick="setTab('terminal')">Terminal</button><button id="tab-git" onclick="setTab('git')">Git</button><button id="tab-dev" onclick="setTab('dev')">Dev</button></div><pre id="pane"></pre><textarea id="input" rows="3" placeholder="Send input to selected tab…"></textarea><div class="actions"><button class="ok" onclick="sendInput(true)">Send Enter</button><button onclick="sendInput(false)">Send Raw</button><button onclick="quick('\u0003',false)">Ctrl-C</button><button onclick="quick('\u001b',false)">Esc</button><button onclick="quick('\t',false)">Tab</button></div><div class="actions"><button onclick="act('start-dev')">Start Dev</button><button onclick="act('stop-dev')">Stop Dev</button><button onclick="act('restart')">Restart</button><button class="danger" onclick="danger('kill')">Kill</button><button class="danger" onclick="danger('remove')">Remove</button></div></div></section>
+<section id="new" class="card"><h2>New session</h2><input id="newTitle" placeholder="Title"/><select id="newProgram"><option>claude</option><option>pi</option><option>codex</option></select><input id="newCwd" placeholder="Remote cwd, e.g. /Users/me/project"/><select id="newWorktree"><option value="none">No worktree</option><option value="new">New worktree</option></select><button class="primary" onclick="createSession()">Create</button><p id="newErr" class="err"></p></section>
+</div><script>
+let token=new URLSearchParams(location.hash.replace(/^#/, '')).get('token')||localStorage.getItem('deckhandToken')||'';if(location.hash&&token){localStorage.setItem('deckhandToken',token);history.replaceState(null,'',location.pathname);}let sessions=[];let selected='';let tab='preview';let timer=0;
+const $=id=>document.getElementById(id);function headers(){return token?{authorization:'Bearer '+token}:{};}async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{'content-type':'application/json',...headers(),...(opts.headers||{})}});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j;}
+async function refresh(){try{const st=await api('/api/status');$('conn').textContent='mobile · '+(st.remote.host||'')+':'+(st.remote.port||'')+' · '+st.remote.mode+(st.authenticated?' · authenticated':'');$('login').classList.toggle('hidden',st.authenticated);if(!st.authenticated)return;const data=await api('/api/sessions');sessions=data.sessions||[];renderList();if(selected)await loadPane();}catch(e){$('conn').textContent='error: '+e.message;$('login').classList.remove('hidden');}}
+function renderList(){const el=$('list');el.innerHTML='';sessions.forEach(s=>{const b=document.createElement('button');b.innerHTML='<div class="row"><div><div class="title">'+esc(s.title)+'</div><div class="status">'+esc(s.program)+' · '+esc(short(s.cwd))+'</div></div><span class="pill">'+esc(s.agentStatus||s.status)+'</span></div>';b.onclick=()=>openSession(s.id);el.appendChild(b);});}
+async function openSession(id){selected=id;$('list').classList.add('hidden');$('new').classList.add('hidden');$('detail').classList.remove('hidden');await loadPane();timer&&clearInterval(timer);timer=setInterval(loadPane,2000);}function back(){selected='';clearInterval(timer);$('detail').classList.add('hidden');$('list').classList.remove('hidden');$('new').classList.remove('hidden');}
+function setTab(t){tab=t;loadPane();}function activeTabs(){['preview','terminal','git','dev'].forEach(t=>$('tab-'+t).classList.toggle('active',t===tab));}
+async function loadPane(){if(!selected)return;activeTabs();const s=sessions.find(x=>x.id===selected)||{};$('sTitle').textContent=s.title||selected;$('sMeta').textContent=(s.program||'')+' · '+(s.cwd||'');$('sState').textContent=s.agentStatus||s.status||'';const path=tab==='preview'?'/preview':'/'+tab;const j=await api('/api/sessions/'+selected+path);const rec=j.preview||j.terminal||j.git||j.dev||{};$('pane').textContent=rec.content||'';}
+async function sendInput(enter){const data=$('input').value;if(!data&&!enter)return;await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:tab==='preview'?'agent':tab,data,enter})});$('input').value='';setTimeout(loadPane,300);}async function quick(data,enter){await api('/api/sessions/'+selected+'/input',{method:'POST',body:JSON.stringify({target:tab==='preview'?'agent':tab,data,enter})});setTimeout(loadPane,300);}
+async function act(a){await api('/api/sessions/'+selected+'/'+a,{method:'POST',body:'{}'});setTimeout(refresh,500);}async function danger(a){const s=sessions.find(x=>x.id===selected);if(!confirm(a+' '+(s?.title||selected)+' on remote Deckhand?'))return;await act(a);if(a==='remove')back();}
+function saveToken(){token=$('token').value.trim();localStorage.setItem('deckhandToken',token);refresh();}async function pairDevice(){try{const j=await api('/api/pair',{method:'POST',body:JSON.stringify({code:$('pair').value.trim()})});token=j.token;localStorage.setItem('deckhandToken',token);$('loginErr').textContent='';refresh();}catch(e){$('loginErr').textContent=e.message;}}
+async function createSession(){try{const body={title:$('newTitle').value,program:$('newProgram').value,cwd:$('newCwd').value,worktreeMode:$('newWorktree').value,cols:100,rows:34};await api('/api/create',{method:'POST',body:JSON.stringify(body)});$('newErr').textContent='';$('newTitle').value='';refresh();}catch(e){$('newErr').textContent=e.message;}}
+function esc(s){return String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}function short(s){s=String(s||'');return s.length>42?'…'+s.slice(-41):s;}refresh();setInterval(refresh,10000);
+</script></body></html>`;
+
+
 export class InkDaemon {
 	private readonly sessions = new Map<string, SessionRecord>();
 	private readonly runtime = new Map<string, RuntimeSession>();
@@ -291,6 +357,9 @@ export class InkDaemon {
 	private readonly workers = new Map<string, WorkerRuntime>();
 	private readonly clients = new Map<net.Socket, ClientSubscription>();
 	private server?: net.Server;
+	private remoteServer?: http.Server;
+	private remoteConfig?: Required<Pick<RemoteControlConfig, 'enabled' | 'host' | 'port' | 'mode'>> & {tokenHash?: string};
+	private remotePairing?: RemotePairingState;
 	private shuttingDown = false;
 
 	async start(): Promise<void> {
@@ -308,6 +377,7 @@ export class InkDaemon {
 
 		await this.prepareSocket();
 		await this.listen();
+		await this.listenRemoteIfEnabled();
 		await this.writePidFile();
 		this.setupProcessHandlers();
 		await this.log(`daemon ready socket=${getSocketPath()}`);
@@ -380,6 +450,26 @@ export class InkDaemon {
 			this.server?.once('error', reject);
 			this.server?.listen(getSocketPath(), () => resolve());
 		});
+	}
+
+	private async listenRemoteIfEnabled(): Promise<void> {
+		const config = await loadAppConfig();
+		const remote = config.remote_control;
+		if (!remote?.enabled) {
+			return;
+		}
+		const host = remote.host || DEFAULT_REMOTE_HOST;
+		const port = Number.isFinite(remote.port) ? Number(remote.port) : DEFAULT_REMOTE_PORT;
+		const mode = remote.mode || DEFAULT_REMOTE_MODE;
+		this.remoteConfig = {enabled: true, host, port, mode, tokenHash: remote.tokenHash};
+		this.remoteServer = http.createServer((request, response) => {
+			void this.handleRemoteHttp(request, response);
+		});
+		await new Promise<void>((resolve, reject) => {
+			this.remoteServer?.once('error', reject);
+			this.remoteServer?.listen(port, host, () => resolve());
+		});
+		await this.log(`remote mobile control listening http://${host}:${port} mode=${mode}`);
 	}
 
 	private setupProcessHandlers(): void {
@@ -510,6 +600,9 @@ export class InkDaemon {
 		if (this.server) {
 			this.server.close();
 		}
+		if (this.remoteServer) {
+			this.remoteServer.close();
+		}
 		try {
 			await fs.unlink(getSocketPath());
 		} catch {
@@ -621,6 +714,9 @@ export class InkDaemon {
 			switch (message.type) {
 				case 'ping':
 					sendMessage(socket, response(message.requestId, {ok: true, version: PROTOCOL_VERSION}));
+					return;
+				case 'remote-pair':
+					sendMessage(socket, response(message.requestId, this.createRemotePairing()));
 					return;
 				case 'list':
 					sendMessage(socket, response(message.requestId, sortSessionsForSidebar([...this.sessions.values()])));
@@ -973,6 +1069,230 @@ export class InkDaemon {
 				sendMessage(socket, failure(message.requestId, error));
 			}
 		}
+	}
+
+	private createRemotePairing(): RemotePairingInfo {
+		if (!this.remoteConfig?.enabled) {
+			throw new Error('remote control is not enabled; run deckhand remote enable first and restart the daemon if needed');
+		}
+		const code = String(Math.floor(100_000 + Math.random() * 900_000));
+		const expiresAt = Date.now() + PAIRING_CODE_TTL_MS;
+		this.remotePairing = {code, expiresAt};
+		return {
+			code,
+			expiresAt: new Date(expiresAt).toISOString(),
+			url: remoteHttpUrl(this.remoteConfig.host, this.remoteConfig.port),
+		};
+	}
+
+	private async readRemoteJson(request: IncomingMessage): Promise<unknown> {
+		let body = '';
+		for await (const chunk of request) {
+			body += chunk.toString();
+			if (body.length > 64 * 1024) {
+				throw new Error('request body too large');
+			}
+		}
+		if (!body.trim()) {
+			return undefined;
+		}
+		return JSON.parse(body) as unknown;
+	}
+
+	private sendHttp(response: HttpServerResponse, status: number, data: unknown, headers: Record<string, string> = {}): void {
+		response.writeHead(status, {
+			'content-type': 'application/json; charset=utf-8',
+			'cache-control': 'no-store',
+			'x-content-type-options': 'nosniff',
+			'referrer-policy': 'no-referrer',
+			...headers,
+		});
+		response.end(`${JSON.stringify(data)}\n`);
+	}
+
+	private sendHtml(response: HttpServerResponse): void {
+		response.writeHead(200, {
+			'content-type': 'text/html; charset=utf-8',
+			'cache-control': 'no-store',
+			'x-content-type-options': 'nosniff',
+			'referrer-policy': 'no-referrer',
+		});
+		response.end(MOBILE_HTML);
+	}
+
+	private isRemoteAuthorized(request: IncomingMessage): boolean {
+		const auth = request.headers.authorization;
+		if (!auth?.startsWith('Bearer ')) {
+			return false;
+		}
+		return verifySecret(auth.slice('Bearer '.length).trim(), this.remoteConfig?.tokenHash);
+	}
+
+	private assertRemotePermission(kind: 'read' | 'interactive' | 'admin'): void {
+		const mode = this.remoteConfig?.mode || DEFAULT_REMOTE_MODE;
+		if (kind === 'read') return;
+		if (kind === 'interactive' && (mode === 'interactive' || mode === 'admin')) return;
+		if (kind === 'admin' && mode === 'admin') return;
+		throw new Error(`remote is ${mode}; this action requires ${kind}`);
+	}
+
+	private async handleRemoteHttp(request: IncomingMessage, response: HttpServerResponse): Promise<void> {
+		try {
+			const url = new URL(request.url || '/', `http://${request.headers.host || 'deckhand.local'}`);
+			if (request.method === 'GET' && url.pathname === '/') {
+				this.sendHtml(response);
+				return;
+			}
+			if (!url.pathname.startsWith('/api/')) {
+				this.sendHttp(response, 404, {error: 'not found'});
+				return;
+			}
+			const parsed: RemoteHttpRequest = {
+				method: request.method || 'GET',
+				pathname: url.pathname,
+				query: url.searchParams,
+				body: request.method === 'GET' ? undefined : await this.readRemoteJson(request),
+			};
+			if (parsed.pathname === '/api/status') {
+				this.sendHttp(response, 200, {
+					ok: true,
+					version: PROTOCOL_VERSION,
+					remote: {mode: this.remoteConfig?.mode || DEFAULT_REMOTE_MODE, host: this.remoteConfig?.host, port: this.remoteConfig?.port},
+					authenticated: this.isRemoteAuthorized(request),
+					pairingAvailable: Boolean(this.remotePairing && this.remotePairing.expiresAt > Date.now()),
+				});
+				return;
+			}
+			if (parsed.pathname === '/api/pair' && parsed.method === 'POST') {
+				const body = parsed.body as {code?: string} | undefined;
+				if (!this.remotePairing || this.remotePairing.expiresAt <= Date.now() || body?.code !== this.remotePairing.code) {
+					this.sendHttp(response, 401, {error: 'invalid or expired pairing code'});
+					return;
+				}
+				this.remotePairing = undefined;
+				const token = randomBytes(24).toString('base64url');
+				if (this.remoteConfig) {
+					this.remoteConfig.tokenHash = sha256(token);
+					const config = await loadAppConfig();
+					await saveAppConfig({...config, remote_control: {...config.remote_control, ...this.remoteConfig, tokenHash: this.remoteConfig.tokenHash}});
+				}
+				this.sendHttp(response, 200, {token});
+				return;
+			}
+			if (!this.isRemoteAuthorized(request)) {
+				this.sendHttp(response, 401, {error: 'authentication required'});
+				return;
+			}
+			await this.handleRemoteApi(parsed, response);
+		} catch (error) {
+			this.sendHttp(response, 500, {error: error instanceof Error ? error.message : String(error)});
+		}
+	}
+
+	private async handleRemoteApi(request: RemoteHttpRequest, response: HttpServerResponse): Promise<void> {
+		const parts = request.pathname.split('/').filter(Boolean);
+		if (request.pathname === '/api/sessions' && request.method === 'GET') {
+			this.assertRemotePermission('read');
+			this.sendHttp(response, 200, {sessions: sortSessionsForSidebar([...this.sessions.values()])});
+			return;
+		}
+		if (request.pathname === '/api/create' && request.method === 'POST') {
+			this.assertRemotePermission('admin');
+			const body = request.body as Partial<CreateSessionInput> | undefined;
+			if (!body?.title || !body.program || !body.cwd) throw new Error('title, program, and cwd are required');
+			const repoRoot = body.repoRoot || await findRepoRoot(body.cwd);
+			const session = await this.createSession({
+				title: body.title,
+				program: body.program,
+				cwd: body.cwd,
+				repoRoot,
+				cols: clampSize(body.cols ?? MOBILE_PREVIEW_COLS, MOBILE_PREVIEW_COLS),
+				rows: clampSize(body.rows ?? MOBILE_PREVIEW_ROWS, MOBILE_PREVIEW_ROWS),
+				worktreeMode: body.worktreeMode,
+				existingWorktreePath: body.existingWorktreePath,
+			});
+			this.sendHttp(response, 200, {session});
+			return;
+		}
+		if (parts[0] === 'api' && parts[1] === 'sessions' && parts[2]) {
+			const sessionId = parts[2];
+			const action = parts[3];
+			if (!action && request.method === 'GET') {
+				this.assertRemotePermission('read');
+				const session = this.sessions.get(sessionId);
+				if (!session) throw new Error('session not found');
+				this.sendHttp(response, 200, {session});
+				return;
+			}
+			if (action === 'preview' && request.method === 'GET') {
+				this.assertRemotePermission('read');
+				const cols = clampSize(Number(request.query.get('cols') || MOBILE_PREVIEW_COLS), MOBILE_PREVIEW_COLS);
+				const rows = clampSize(Number(request.query.get('rows') || MOBILE_PREVIEW_ROWS), MOBILE_PREVIEW_ROWS);
+				const scrollOffset = clampNonNegative(Number(request.query.get('scrollOffset') || 0));
+				this.sendHttp(response, 200, {preview: await this.getPreviewRecord(sessionId, cols, rows, scrollOffset)});
+				return;
+			}
+			if ((action === 'terminal' || action === 'git' || action === 'dev') && request.method === 'GET') {
+				this.assertRemotePermission('read');
+				const cols = clampSize(Number(request.query.get('cols') || MOBILE_PREVIEW_COLS), MOBILE_PREVIEW_COLS);
+				const rows = clampSize(Number(request.query.get('rows') || MOBILE_PREVIEW_ROWS), MOBILE_PREVIEW_ROWS);
+				const record = action === 'terminal' ? await this.getTerminalRecord(sessionId, cols, rows) : action === 'git' ? await this.getGitRecord(sessionId, cols, rows) : await this.getDevRecord(sessionId, cols, rows);
+				this.sendHttp(response, 200, {[action]: record});
+				return;
+			}
+			if (action === 'input' && request.method === 'POST') {
+				this.assertRemotePermission('interactive');
+				const body = request.body as {target?: AttachTarget; data?: string; enter?: boolean} | undefined;
+				const target = body?.target || 'agent';
+				const data = `${body?.data || ''}${body?.enter === false ? '' : '\r'}`;
+				await this.remoteWriteInput(sessionId, target, data);
+				this.sendHttp(response, 200, {ok: true});
+				return;
+			}
+			if (action === 'restart' && request.method === 'POST') {
+				this.assertRemotePermission('admin');
+				this.sendHttp(response, 200, {session: await this.restartSession(sessionId, MOBILE_PREVIEW_COLS, MOBILE_PREVIEW_ROWS)});
+				return;
+			}
+			if (action === 'kill' && request.method === 'POST') {
+				this.assertRemotePermission('admin');
+				const body = request.body as {deleteWorktree?: boolean; deleteBranch?: boolean; force?: boolean} | undefined;
+				await this.killSession(sessionId, body?.deleteWorktree ?? false, body?.deleteBranch ?? false, body?.force ?? false);
+				this.sendHttp(response, 200, {ok: true});
+				return;
+			}
+			if (action === 'remove' && request.method === 'POST') {
+				this.assertRemotePermission('admin');
+				await this.removeSession(sessionId);
+				this.sendHttp(response, 200, {ok: true});
+				return;
+			}
+			if (action === 'start-dev' && request.method === 'POST') {
+				this.assertRemotePermission('interactive');
+				const dev = this.workers.has(sessionId) ? await this.sendWorkerRequest<DevRecord>(sessionId, {type: 'start-dev', cols: MOBILE_PREVIEW_COLS, rows: MOBILE_PREVIEW_ROWS}) : this.buildDevRecord(sessionId, await this.startDev(sessionId, MOBILE_PREVIEW_COLS, MOBILE_PREVIEW_ROWS));
+				this.sendHttp(response, 200, {dev});
+				return;
+			}
+			if (action === 'stop-dev' && request.method === 'POST') {
+				this.assertRemotePermission('interactive');
+				if (this.workers.has(sessionId)) await this.sendWorkerRequest(sessionId, {type: 'stop-dev'});
+				else { this.cleanupDev(sessionId); await this.broadcastDev(sessionId); }
+				this.sendHttp(response, 200, {ok: true});
+				return;
+			}
+		}
+		this.sendHttp(response, 404, {error: 'not found'});
+	}
+
+	private async remoteWriteInput(sessionId: string, target: AttachTarget, data: string): Promise<void> {
+		if (this.workers.has(sessionId)) {
+			this.sendWorkerEvent(sessionId, {type: 'input', target, data});
+			return;
+		}
+		if (target === 'agent') this.runtime.get(sessionId)?.term.write(data);
+		else if (target === 'terminal') this.terminals.get(sessionId)?.term.write(data);
+		else if (target === 'git') this.gits.get(sessionId)?.term.write(data);
+		else this.devs.get(sessionId)?.term.write(data);
 	}
 
 	private async startWorker(session: SessionRecord, cols: number, rows: number): Promise<SessionRecord> {

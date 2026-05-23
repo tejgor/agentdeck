@@ -33,6 +33,7 @@ Implemented behavior:
 - frozen last preview frame for exited sessions
 - stale-session cleanup after daemon restart
 - daemon PID/log files and protocol-version safeguards
+- optional authenticated mobile remote-control web UI served by the daemon
 
 ## Architecture
 
@@ -63,7 +64,7 @@ The UI:
 Responsibilities:
 
 - load/save persisted session metadata
-- own the IPC socket
+- own the IPC socket and optional mobile remote HTTP listener
 - start/stop session workers
 - route attach/input/resize requests to workers
 - receive worker snapshots and lifecycle messages
@@ -163,6 +164,39 @@ Preview focus is read-only for most agents and scrolls Deckhand's daemon-side xt
 Both attach mode and Preview focus use `attach_scroll_sensitivity` from config, defaulting to `0.12`.
 
 Exited sessions show only the frozen `lastPreview` frame.
+
+## Mobile remote control
+
+Remote control is opt-in and daemon-hosted. `deckhand remote enable` writes `remote_control` config with a generated token hash. The daemon starts the HTTP listener on its next start when `remote_control.enabled` is true. Existing daemons should be restarted after enable/disable/token changes unless using the runtime pairing flow.
+
+CLI commands:
+
+- `deckhand remote enable [--host <host>] [--port <port>] [--mode read-only|interactive|admin]`
+- `deckhand remote disable`
+- `deckhand remote status`
+- `deckhand remote token` rotates and prints a new bearer token
+- `deckhand remote pair` uses local IPC request `remote-pair` to create a 5-minute pairing code; successful `/api/pair` rotates/persists a new token and returns it to the browser
+
+HTTP routes in `src/daemon.ts`:
+
+- `GET /` serves an embedded mobile HTML/JS app
+- `GET /api/status` is unauthenticated and reports listener/mode/auth state
+- `POST /api/pair` accepts a short-lived pairing code and issues a token
+- Bearer-authenticated routes:
+  - `GET /api/sessions`
+  - `POST /api/create`
+  - `GET /api/sessions/:id`
+  - `GET /api/sessions/:id/preview|terminal|git|dev`
+  - `POST /api/sessions/:id/input`
+  - `POST /api/sessions/:id/restart|kill|remove|start-dev|stop-dev`
+
+Security model:
+
+- disabled by default
+- strong bearer token; only SHA-256 hash is stored
+- default bind is loopback; bind `0.0.0.0` only for trusted LAN/VPN/Tailscale use
+- built-in server is HTTP, not HTTPS; do not expose it to the public internet
+- remote modes gate actions: `read-only`, `interactive`, `admin`
 
 ## Worktree behavior
 
@@ -267,11 +301,17 @@ Config currently includes:
 
 - `dev_command`, default `dev`
 - `attach_scroll_sensitivity`, default `0.12`
+- `remote_control`:
+  - `enabled`, default false
+  - `host`, default `127.0.0.1`
+  - `port`, default `17345`
+  - `mode`: `read-only`, `interactive`, or `admin` (CLI default `admin`)
+  - `tokenHash`: SHA-256 hash of the mobile bearer token
 
 Protocol:
 
 - line-delimited JSON
-- current protocol version: **v18**
+- current protocol version: **v19**
 
 If an older daemon is still running:
 
@@ -331,6 +371,7 @@ Tracked metadata includes:
 Supported request types include:
 
 - `ping`
+- `remote-pair`
 - `list`
 - `subscribe`
 - `list-worktrees`
@@ -377,7 +418,7 @@ Emitted event types include:
 - `src/cli.ts` — entry point; runs UI or daemon; loops around attach/detach.
 - `src/app.tsx` — main Ink UI and interaction state.
 - `src/client.ts` — daemon client, autostart, protocol version checks, persistent live client.
-- `src/daemon.ts` — supervisor daemon and IPC handling.
+- `src/daemon.ts` — supervisor daemon, IPC handling, and optional mobile remote HTTP UI/API.
 - `src/sessionWorker.ts` — per-session PTY owner.
 - `src/attach.ts` — full-screen attach/detach mode.
 - `src/storage.ts` — state/config loading and persistence.
@@ -491,6 +532,7 @@ Validated during development:
 - TypeScript build with Claude exit resume-handle parsing for forked sub-session restarts
 - TypeScript build with deleted-worktree sessions marked non-restartable/non-mergeable
 - TypeScript build with named Claude `/fork <dh-name>` creation
+- TypeScript build with mobile remote-control HTTP UI/API and CLI commands
 - sanitizer behavior, including slash-preserving names
 - current/main worktree root lookup
 - `git worktree list --porcelain` parsing, including main worktree

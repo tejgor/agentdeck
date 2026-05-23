@@ -207,6 +207,41 @@ Attached sessions dampen trackpad and mouse-wheel scrolling. Set the multiplier:
 
 Use `1` for normal terminal scrolling, lower values for slower scrolling, or `0` to ignore vertical wheel events while attached. Default: `0.12`.
 
+### Mobile remote control
+
+Deckhand can optionally serve an authenticated mobile web UI from the daemon. It is disabled by default.
+
+```bash
+# Loopback-only, good for SSH/Tailscale tunnels
+deckhand remote enable
+
+# LAN/VPN access for your phone
+deckhand remote enable --host 0.0.0.0 --port 17345 --mode admin
+```
+
+The command prints a one-time token. Open the printed URL from your phone and paste the token, or run:
+
+```bash
+deckhand remote pair
+```
+
+Then enter the short pairing code in the phone UI. The mobile UI supports session list/status, Preview/Terminal/Git/Dev snapshots, sending input and quick keys, creating sessions by remote cwd, start/stop Dev, restart, kill, and remove.
+
+Security notes:
+
+- Anyone with the token can control Deckhand sessions and type into PTYs.
+- The built-in server is HTTP with bearer-token auth; use it only on trusted LAN/VPN/Tailscale networks or behind your own HTTPS proxy.
+- Do not expose the port directly to the public internet.
+- Remote config is stored in `~/.deckhand/config.json`; tokens are stored as SHA-256 hashes.
+
+Useful commands:
+
+```bash
+deckhand remote status
+deckhand remote token   # rotate/print a new token
+deckhand remote disable
+```
+
 ### State and logs
 
 | Path | Purpose |
@@ -216,6 +251,7 @@ Use `1` for normal terminal scrolling, lower values for slower scrolling, or `0`
 | `~/.deckhand/daemon.log` | Supervisor daemon diagnostics |
 | `~/.deckhand/daemon.pid` | Active supervisor daemon PID |
 | `~/.deckhand/daemon.sock` | Local IPC socket |
+| optional `host:port` from config | Authenticated mobile remote HTTP listener |
 | `~/.deckhand/workers/` | Per-session worker PID and log files |
 | `~/.deckhand/worktrees/` | Default location for auto-created worktrees |
 | `~/.pi/agent/sessions/` | Pi's normal session storage; Deckhand-created Pi sessions live here |
